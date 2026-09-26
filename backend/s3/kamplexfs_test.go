@@ -460,10 +460,11 @@ func TestKamPlexFSDirMove(t *testing.T) {
 		dstRemote string
 		wantPath  string
 		wantSrc   string
+		wantRmdir bool // the source bucket is removed
 	}{
-		{"Subdirs", "bucket", "a b", "bucket", "c+d", "/s3/bucket/c%2Bd/", "/bucket/a%20b/"},
-		{"Roots", "bucket/src", "", "bucket2/dst", "", "/s3/bucket2/dst/", "/bucket/src/"},
-		{"WholeBuckets", "bucket", "", "bucket2", "", "/s3/bucket2/", "/bucket/"},
+		{"Subdirs", "bucket", "a b", "bucket", "c+d", "/s3/bucket/c%2Bd/", "/bucket/a%20b/", false},
+		{"Roots", "bucket/src", "", "bucket2/dst", "", "/s3/bucket2/dst/", "/bucket/src/", false},
+		{"WholeBuckets", "bucket", "", "bucket2", "", "/s3/bucket2/", "/bucket/", true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			srcFs := newKamPlexFSTestFs(ctx, t, k.endpoint(), kamplexfsProvider, nil)
@@ -479,6 +480,11 @@ func TestKamPlexFSDirMove(t *testing.T) {
 			assert.Equal(t, test.wantPath, r.Path)
 			assert.Equal(t, test.wantSrc, r.Header.Get("X-Kamplexfs-Rename-Source"))
 			assert.True(t, strings.HasPrefix(r.Header.Get("Authorization"), "AWS4-HMAC-SHA256 "))
+			if test.wantRmdir {
+				assert.Equal(t, 1, k.count("DELETE"), "must remove the empty source bucket")
+			} else {
+				assert.Equal(t, 0, k.count("DELETE"))
+			}
 		})
 	}
 
