@@ -96,7 +96,7 @@ the tokens. Leave blank for no restriction.`,
 			Advanced: true,
 		}, {
 			Name:     "route",
-			Help:     "The route the JSON API is mounted on.",
+			Help:     "The route the JSON API is mounted on.\n\nThe bucket endpoints are expected next to it, e.g. /api/v1/buckets\nfor /api/v1/files.",
 			Default:  defaultRoute,
 			Advanced: true,
 		}, {
@@ -132,27 +132,40 @@ type Options struct {
 
 // Fs represents a remote KamPlexFS server
 type Fs struct {
-	name          string       // name of this remote
-	root          string       // the path we are working on
-	opt           Options      // parsed options
-	features      *fs.Features // optional features
-	srv           *rest.Client // the connection to the server
-	pacer         *fs.Pacer    // pacer for API calls
-	tokens        *tokenSource // JWTs for the requests
-	rootBucket    string       // bucket part of root (if any)
-	rootDirectory string       // directory part of root (if any)
-	server        *serverState // what has been learnt about the server
+	name          string        // name of this remote
+	root          string        // the path we are working on
+	opt           Options       // parsed options
+	features      *fs.Features  // optional features
+	srv           *rest.Client  // the connection to the server
+	pacer         *fs.Pacer     // pacer for API calls
+	tokens        *tokenSource  // JWTs for the requests
+	rootBucket    string        // bucket part of root (if any)
+	rootDirectory string        // directory part of root (if any)
+	bucketsURL    string        // URL of the bucket endpoints
+	cache         *bucket.Cache // cache for bucket creation status
+	server        *serverState  // what has been learnt about the server
 	noFoldersOnce sync.Once
 }
 
 // serverState is what has been learnt about a server from its
 // responses, shared by all the Fs talking to it.
 type serverState struct {
-	mtimeNanos   atomic.Bool // set if the server stores sub-second mtimes
-	noSetModTime atomic.Bool // set if the server can't set mtimes
-	noRecursive  atomic.Bool // set if the server can't list recursively
-	noFolders    atomic.Bool // set if the server can't store empty folders
+	mtimeNanos   atomic.Bool  // set if the server stores sub-second mtimes
+	noSetModTime atomic.Bool  // set if the server can't set mtimes
+	noRecursive  atomic.Bool  // set if the server can't list recursively
+	noFolders    atomic.Bool  // set if the server can't store empty folders
+	bucketAPI    atomic.Int32 // whether the server has bucket endpoints
+	// whether recursive listings have every folder in the first page
+	recursiveFolders atomic.Int32
 }
+
+// Values of the serverState fields which are unknown until the
+// server has been asked
+const (
+	stateUnknown int32 = iota
+	stateYes
+	stateNo
+)
 
 // servers holds the serverState for each server keyed by its base URL
 var servers sync.Map
@@ -440,8 +453,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		opt:    *opt,
 		tokens: ts,
 		server: server.(*serverState),
-		srv:    rest.NewClient(fshttp.NewClient(ctx)).SetRoot(rootURL).SetErrorHandler(errorHandler),
-		pacer:  fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+		// The bucket endpoints are mounted next to the file ones,
+		// e.g. /api/v1/buckets for /api/v1/files
+		bucketsURL: strings.TrimSuffix(opt.URL, "/") + path.Join("/", path.Dir(route), "buckets"),
+		cache:      bucket.NewCache(),
+		srv:        rest.NewClient(fshttp.NewClient(ctx)).SetRoot(rootURL).SetErrorHandler(errorHandler),
+		pacer:      fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
 	f.setRoot(root)
 	f.features = (&fs.Features{
@@ -509,10 +526,16 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 // errEndList stops a listing early
 var errEndList = errors.New("end list")
 
+// errWalkInstead is returned by a recursive listing which would leave
+// out empty folders
+var errWalkInstead = errors.New("recursive listing has no folders")
+
 // listPages lists the folder at bucket/directory calling fnFile and
 // fnFolder for each entry, following the pages of the listing.
 //
-// It returns fs.ErrorDirNotFound if the folder doesn't exist.
+// It returns fs.ErrorDirNotFound if the folder doesn't exist, and
+// errWalkInstead before calling anything if a recursive listing leaves
+// out folders which may be empty.
 func (f *Fs) listPages(ctx context.Context, bucket, directory string, recursive bool, fnFile func(*api.File) error, fnFolder func(*api.Folder) error) error {
 	p := "/list/" + escape(bucket)
 	if directory != "" {
@@ -538,6 +561,12 @@ func (f *Fs) listPages(ctx context.Context, bucket, directory string, recursive 
 				return fs.ErrorDirNotFound
 			}
 			return fmt.Errorf("list failed: %w", err)
+		}
+		if recursive && pageToken == "" {
+			f.noteRecursiveFolders(result.Recursive)
+			if !result.Recursive && !f.server.noFolders.Load() {
+				return errWalkInstead
+			}
 		}
 		for i := range result.Folders {
 			err = fnFolder(&result.Folders[i])
@@ -581,10 +610,11 @@ func (f *Fs) listDir(ctx context.Context, bucket, directory, dir string, recursi
 	}, func(info *api.Folder) error {
 		dirRemote := remote(info.Path, info.Name)
 		err := callback(fs.NewDir(dirRemote, time.Time{}))
-		if err != nil || !recursive {
+		if err != nil || !recursive || f.server.recursiveFolders.Load() == stateYes {
 			return err
 		}
-		// A server which can list recursively returns no folders
+		// A server which can list recursively without saying so
+		// returns no folders
 		if !f.server.noRecursive.Swap(true) {
 			fs.Debugf(f, "Server can't list recursively - walking the folders instead")
 		}
@@ -593,16 +623,81 @@ func (f *Fs) listDir(ctx context.Context, bucket, directory, dir string, recursi
 	})
 }
 
+// noBucketAPI returns true if err from a bucket endpoint shows the
+// server doesn't have them, recording it if so.
+func (f *Fs) noBucketAPI(err error) bool {
+	switch statusCode(err) {
+	case http.StatusNotFound, http.StatusMethodNotAllowed:
+		if f.server.bucketAPI.Swap(stateNo) != stateNo {
+			fs.Debugf(f, "Server has no bucket endpoints so buckets must already exist: %v", err)
+		}
+		return true
+	}
+	return false
+}
+
+// callBuckets calls the bucket endpoint for name, or the collection
+// of buckets if name is "".
+func (f *Fs) callBuckets(ctx context.Context, method, name string, request, response any) error {
+	opts := rest.Opts{
+		Method:  method,
+		RootURL: f.bucketsURL,
+	}
+	if name != "" {
+		opts.Path = "/" + escape(name)
+	}
+	_, err := f.callJSON(ctx, &opts, request, response)
+	return err
+}
+
+// hasBucketAPI returns true if the server has the bucket endpoints,
+// listing the buckets to find out if it isn't known yet.
+func (f *Fs) hasBucketAPI(ctx context.Context) (bool, error) {
+	switch f.server.bucketAPI.Load() {
+	case stateYes:
+		return true, nil
+	case stateNo:
+		return false, nil
+	}
+	_, err := f.listBuckets(ctx)
+	if err != nil {
+		return false, err
+	}
+	return f.server.bucketAPI.Load() == stateYes, nil
+}
+
+// noteRecursiveFolders records whether recursive listings have every
+// folder, as marked on their first page
+func (f *Fs) noteRecursiveFolders(marked bool) {
+	state := stateNo
+	if marked {
+		state = stateYes
+	}
+	if f.server.recursiveFolders.Swap(state) != state {
+		fs.Debugf(f, "Recursive listings have every folder: %v", marked)
+	}
+}
+
 // listBuckets lists the buckets
 func (f *Fs) listBuckets(ctx context.Context) (entries fs.DirEntries, err error) {
-	opts := rest.Opts{
-		Method: "GET",
-		Path:   "/list",
-	}
 	var result api.BucketList
-	_, err = f.callJSON(ctx, &opts, nil, &result)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list buckets: %w", err)
+	if f.server.bucketAPI.Load() != stateNo {
+		err = f.callBuckets(ctx, "GET", "", nil, &result)
+		if err == nil {
+			f.server.bucketAPI.Store(stateYes)
+		} else if !f.noBucketAPI(err) {
+			return nil, fmt.Errorf("failed to list buckets: %w", err)
+		}
+	}
+	if f.server.bucketAPI.Load() == stateNo {
+		opts := rest.Opts{
+			Method: "GET",
+			Path:   "/list",
+		}
+		_, err = f.callJSON(ctx, &opts, nil, &result)
+		if err != nil {
+			return nil, fmt.Errorf("failed to list buckets: %w", err)
+		}
 	}
 	for _, name := range result.Buckets {
 		entries = append(entries, fs.NewDir(f.opt.Enc.ToStandardName(name), time.Time{}))
@@ -651,28 +746,45 @@ func (f *Fs) List(ctx context.Context, dir string) (entries fs.DirEntries, err e
 // Don't implement this unless you have a more efficient way
 // of listing recursively than doing a directory traversal.
 func (f *Fs) ListR(ctx context.Context, dir string, callback fs.ListRCallback) error {
-	if !f.server.noFolders.Load() {
-		// Recursive listings leave out empty folders which the
-		// server can hold unless it is in packed-volume mode, so
-		// walk the folders instead.
-		ctx, ci := fs.AddConfig(ctx)
-		ci.UseListR = false
-		notFound := false
-		err := walk.Walk(ctx, f, dir, true, -1, func(p string, entries fs.DirEntries, err error) error {
-			if err == fs.ErrorDirNotFound && p == dir {
-				notFound = true
-				return nil
-			}
-			if err != nil {
-				return err
-			}
-			return callback(entries)
-		})
-		if err == nil && notFound {
-			return fs.ErrorDirNotFound
-		}
-		return err
+	if !f.server.noFolders.Load() && f.server.recursiveFolders.Load() == stateNo {
+		return f.walkR(ctx, dir, callback)
 	}
+	err := f.listR(ctx, dir, callback)
+	if err == errWalkInstead {
+		return f.walkR(ctx, dir, callback)
+	}
+	return err
+}
+
+// walkR lists dir recursively by listing each folder in turn
+//
+// It is used when recursive listings leave out empty folders which
+// the server can hold unless it is in packed-volume mode.
+func (f *Fs) walkR(ctx context.Context, dir string, callback fs.ListRCallback) error {
+	ctx, ci := fs.AddConfig(ctx)
+	ci.UseListR = false
+	notFound := false
+	err := walk.Walk(ctx, f, dir, true, -1, func(p string, entries fs.DirEntries, err error) error {
+		if err == fs.ErrorDirNotFound && p == dir {
+			notFound = true
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		return callback(entries)
+	})
+	if err == nil && notFound {
+		return fs.ErrorDirNotFound
+	}
+	return err
+}
+
+// listR lists dir with recursive listings
+//
+// It returns errWalkInstead before calling callback if they would
+// leave out empty folders.
+func (f *Fs) listR(ctx context.Context, dir string, callback fs.ListRCallback) error {
 	bucket, directory := f.split(dir)
 	helper := list.NewHelper(callback)
 	if bucket == "" {
@@ -730,13 +842,47 @@ func (f *Fs) setNoFolders() {
 	})
 }
 
-// Mkdir creates the folder if it doesn't exist
+// makeBucket creates the bucket if it doesn't exist
 //
-// Buckets can't be created through the API so they must already exist.
+// Servers without the bucket endpoints can't create buckets so they
+// must exist already.
+func (f *Fs) makeBucket(ctx context.Context, bucketName string) error {
+	return f.cache.Create(bucketName, func() error {
+		if f.server.bucketAPI.Load() == stateNo {
+			return nil
+		}
+		err := f.callBuckets(ctx, "POST", "", &api.CreateBucket{Name: bucketName}, nil)
+		if err == nil {
+			f.server.bucketAPI.Store(stateYes)
+			return nil
+		}
+		if f.noBucketAPI(err) {
+			return nil
+		}
+		if statusCode(err) == http.StatusForbidden {
+			// A restricted token may not be allowed to create
+			// buckets, or even to look at them, but the bucket
+			// may exist anyway so carry on unless it definitely
+			// doesn't.
+			checkErr := f.callBuckets(ctx, "GET", bucketName, nil, nil)
+			if statusCode(checkErr) != http.StatusNotFound {
+				fs.Debugf(f, "Not allowed to create bucket %q, assuming it exists: %v", bucketName, err)
+				return nil
+			}
+		}
+		return fmt.Errorf("failed to create bucket %q: %w", bucketName, err)
+	}, nil)
+}
+
+// Mkdir creates the folder if it doesn't exist
 func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	bucket, directory := f.split(dir)
-	if bucket == "" || directory == "" {
+	if bucket == "" {
 		return nil
+	}
+	err := f.makeBucket(ctx, bucket)
+	if err != nil || directory == "" {
+		return err
 	}
 	if f.server.noFolders.Load() {
 		f.setNoFolders()
@@ -748,7 +894,7 @@ func (f *Fs) Mkdir(ctx context.Context, dir string) error {
 	}
 	req := api.CreateFolder{Path: dirPath(bucket, directory)}
 	var info api.Folder
-	_, err := f.callJSON(ctx, &opts, &req, &info)
+	_, err = f.callJSON(ctx, &opts, &req, &info)
 	if statusCode(err) == http.StatusNotImplemented {
 		f.setNoFolders()
 		return nil
@@ -779,13 +925,55 @@ func (f *Fs) isEmpty(ctx context.Context, bucket, directory string) (bool, error
 	return empty, nil
 }
 
+// removeBucket deletes the bucket
+//
+// It returns fs.ErrorDirNotFound if it doesn't exist,
+// fs.ErrorDirectoryNotEmpty if it isn't empty and errNoBucketAPI if
+// the server has no bucket endpoints.
+func (f *Fs) removeBucket(ctx context.Context, bucketName string) error {
+	err := f.callBuckets(ctx, "DELETE", bucketName, nil, nil)
+	switch statusCode(err) {
+	case http.StatusConflict:
+		return fs.ErrorDirectoryNotEmpty
+	case http.StatusNotFound:
+		// A server without the bucket endpoints returns 404 too
+		ok, checkErr := f.hasBucketAPI(ctx)
+		if checkErr != nil {
+			return checkErr
+		}
+		if ok {
+			return fs.ErrorDirNotFound
+		}
+		return errNoBucketAPI
+	case http.StatusMethodNotAllowed:
+		f.noBucketAPI(err)
+		return errNoBucketAPI
+	}
+	if err != nil {
+		return fmt.Errorf("failed to delete bucket %q: %w", bucketName, err)
+	}
+	f.cache.MarkDeleted(bucketName)
+	return nil
+}
+
+// errNoBucketAPI is returned by removeBucket if the server has no
+// bucket endpoints
+var errNoBucketAPI = errors.New("no bucket endpoints")
+
 // Rmdir deletes the folder if it is empty
 //
-// Buckets can't be deleted through the API so they are left.
+// Servers without the bucket endpoints can't delete buckets so they
+// are left.
 func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	bucket, directory := f.split(dir)
 	if bucket == "" {
 		return nil
+	}
+	if directory == "" && f.server.bucketAPI.Load() != stateNo {
+		err := f.removeBucket(ctx, bucket)
+		if err != errNoBucketAPI {
+			return err
+		}
 	}
 	if f.server.noFolders.Load() && directory != "" {
 		// folders only exist while they hold objects
@@ -833,6 +1021,12 @@ func (f *Fs) Purge(ctx context.Context, dir string) error {
 	if err != nil {
 		return err
 	}
+	if directory == "" && f.server.bucketAPI.Load() != stateNo {
+		err = f.removeBucket(ctx, bucket)
+		if err != errNoBucketAPI {
+			return err
+		}
+	}
 	if n == 0 {
 		// Nothing was deleted so check the directory existed
 		_, err = f.isEmpty(ctx, bucket, directory)
@@ -876,9 +1070,13 @@ func (f *Fs) moveOrCopy(ctx context.Context, opPath string, srcObj *Object, remo
 	if dstKey == "" {
 		return nil, cantErr
 	}
+	err := f.makeBucket(ctx, dstBucket)
+	if err != nil {
+		return nil, err
+	}
 	// Some servers report success when the source doesn't exist so
 	// check it first.
-	_, err := srcObj.fs.stat(ctx, srcBucket, srcKey)
+	_, err = srcObj.fs.stat(ctx, srcBucket, srcKey)
 	if statusCode(err) == http.StatusNotFound {
 		return nil, fs.ErrorObjectNotFound
 	} else if err != nil {
@@ -971,6 +1169,10 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	if err != nil {
 		return err
 	}
+	err = f.makeBucket(ctx, dstBucket)
+	if err != nil {
+		return err
+	}
 	opts := rest.Opts{
 		Method: "POST",
 		Path:   "/move",
@@ -987,6 +1189,10 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	case http.StatusBadRequest, http.StatusNotImplemented:
 		fs.Debugf(srcFs, "Can't move directory: %v", err)
 		return fs.ErrorCantDirMove
+	}
+	if err == nil && srcDirectory == "" {
+		// Moving a whole bucket leaves it behind empty
+		err = srcFs.Rmdir(ctx, srcRemote)
 	}
 	return err
 }
@@ -1119,6 +1325,10 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if bucket == "" || key == "" {
 		return fs.ErrorCantUploadEmptyFiles
 	}
+	err := o.fs.makeBucket(ctx, bucket)
+	if err != nil {
+		return err
+	}
 	params := url.Values{"mtime": {o.fs.formatMtime(src.ModTime(ctx))}}
 	if md5, err := src.Hash(ctx, hash.MD5); err == nil && md5 != "" {
 		params.Set("md5", md5)
@@ -1136,7 +1346,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 	var info api.File
 	// The body can't be rewound so the upload can't be retried here
-	_, err := o.fs.call(ctx, &opts, true, func() (*http.Response, error) {
+	_, err = o.fs.call(ctx, &opts, true, func() (*http.Response, error) {
 		return o.fs.srv.CallJSON(ctx, &opts, nil, &info)
 	})
 	if err != nil {

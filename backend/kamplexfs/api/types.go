@@ -13,6 +13,7 @@ const (
 	KindFolder     = "kamplexfs#folder"
 	KindFileList   = "kamplexfs#fileList"
 	KindBucketList = "kamplexfs#bucketList"
+	KindBucket     = "kamplexfs#bucket"
 )
 
 // File is a FileResource
@@ -50,12 +51,26 @@ type List struct {
 	Offset        int      `json:"offset"`
 	NextPageToken string   `json:"nextPageToken,omitempty"`
 	HasMore       bool     `json:"hasMore"`
+	// Recursive is set on recursive listings by servers which put
+	// every folder below the prefix in the first page
+	Recursive bool `json:"recursive,omitempty"`
 }
 
 // BucketList is the response to listing the buckets
 type BucketList struct {
 	Kind    string   `json:"kind"`
 	Buckets []string `json:"buckets"`
+}
+
+// Bucket is a BucketResource
+type Bucket struct {
+	Kind string `json:"kind"`
+	Name string `json:"name"`
+}
+
+// CreateBucket is the request to create a bucket
+type CreateBucket struct {
+	Name string `json:"name"`
 }
 
 // Item is the response to a request which may return a file, a

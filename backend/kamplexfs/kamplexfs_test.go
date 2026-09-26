@@ -42,8 +42,14 @@ func runFake(t *testing.T, name string, fake *fakeServer) {
 	// use small pages to test paging
 	t.Setenv(prefix+"LIST_CHUNK", "7")
 
+	// With the bucket endpoints the tests make their own bucket so
+	// the bucket level tests run too.
+	root := ":"
+	if !fake.bucketAPI {
+		root = ":bucket"
+	}
 	fstests.Run(t, &fstests.Opt{
-		RemoteName:  remote + ":bucket",
+		RemoteName:  remote + root,
 		NilObject:   (*Object)(nil),
 		QuickTestOK: true,
 	})
@@ -63,7 +69,8 @@ func TestFakePackedVolume(t *testing.T) {
 }
 
 // TestFakeOldServer tests against a server without sub-second
-// mtimes, set mtime, recursive listing or 404 for a missing source
+// mtimes, set mtime, recursive listing, 404 for a missing source or
+// bucket endpoints
 func TestFakeOldServer(t *testing.T) {
 	runFake(t, "OldServer", newFakeServer("").oldServer())
 }

@@ -15,6 +15,7 @@ import (
 	"mime"
 	"net/http"
 	"path"
+	"regexp"
 	"slices"
 	"sort"
 	"strconv"
@@ -43,12 +44,16 @@ type fakeServer struct {
 	maxTTL time.Duration
 
 	// server features and modes
-	packed     bool // packed-volume mode: no empty folders
-	nanos      bool // mtimes have sub-second precision
-	patch      bool // PATCH sets the mtime
-	recursive  bool // recursive listings are supported
-	missing404 bool // move/copy of a missing source is a 404
-	maxPage    int  // largest page size
+	packed    bool // packed-volume mode: no empty folders
+	nanos     bool // mtimes have sub-second precision
+	patch     bool // PATCH sets the mtime
+	recursive bool // recursive listings are supported
+	// recursive listings are marked and have every folder in the
+	// first page
+	recursiveFolders bool
+	missing404       bool // move/copy of a missing source is a 404
+	bucketAPI        bool // the bucket endpoints are supported
+	maxPage          int  // largest page size
 
 	mu       sync.Mutex
 	nextID   int
@@ -77,18 +82,20 @@ type fakeRequest struct {
 // newFakeServer makes a fake server with the given buckets
 func newFakeServer(secret string, buckets ...string) *fakeServer {
 	f := &fakeServer{
-		route:      defaultRoute,
-		secret:     []byte(secret),
-		maxTTL:     24 * time.Hour,
-		nanos:      true,
-		patch:      true,
-		recursive:  true,
-		missing404: true,
-		maxPage:    1000,
-		buckets:    map[string]bool{},
-		files:      map[string]*fakeFile{},
-		folders:    map[string]bool{},
-		now:        time.Now,
+		route:            defaultRoute,
+		secret:           []byte(secret),
+		maxTTL:           24 * time.Hour,
+		nanos:            true,
+		patch:            true,
+		recursive:        true,
+		missing404:       true,
+		recursiveFolders: true,
+		bucketAPI:        true,
+		maxPage:          1000,
+		buckets:          map[string]bool{},
+		files:            map[string]*fakeFile{},
+		folders:          map[string]bool{},
+		now:              time.Now,
 	}
 	for _, b := range buckets {
 		f.buckets[b] = true
@@ -101,7 +108,9 @@ func (f *fakeServer) oldServer() *fakeServer {
 	f.nanos = false
 	f.patch = false
 	f.recursive = false
+	f.recursiveFolders = false
 	f.missing404 = false
+	f.bucketAPI = false
 	return f
 }
 
@@ -147,6 +156,12 @@ func (f *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	p, ok := strings.CutPrefix(r.URL.Path, f.route)
+	bucketsRoute := path.Join(path.Dir(f.route), "buckets")
+	isBuckets := false
+	if !ok && f.bucketAPI && (r.URL.Path == bucketsRoute || strings.HasPrefix(r.URL.Path, bucketsRoute+"/")) {
+		// bucket requests are recorded with their full path
+		p, ok, isBuckets = r.URL.Path, true, true
+	}
 	f.requests = append(f.requests, fakeRequest{
 		Method: r.Method,
 		Path:   p,
@@ -167,6 +182,10 @@ func (f *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !f.authorize(sw, r, p) {
+		return
+	}
+	if isBuckets {
+		f.serveBuckets(sw, r, strings.TrimPrefix(strings.TrimPrefix(p, bucketsRoute), "/"))
 		return
 	}
 	f.serve(sw, r, p)
@@ -302,6 +321,59 @@ func (f *fakeServer) serve(w http.ResponseWriter, r *http.Request, p string) {
 		return
 	}
 	jsonError(w, http.StatusNotFound, "NOT_FOUND", "no such route")
+}
+
+// validBucketName checks a bucket name against the S3 naming rules
+var validBucketName = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$`)
+
+// serveBuckets serves the bucket endpoints, name is "" for the
+// collection
+func (f *fakeServer) serveBuckets(w http.ResponseWriter, r *http.Request, name string) {
+	switch {
+	case name == "" && r.Method == http.MethodGet:
+		var buckets []string
+		for b := range f.buckets {
+			buckets = append(buckets, b)
+		}
+		sort.Strings(buckets)
+		writeJSON(w, http.StatusOK, api.BucketList{Kind: api.KindBucketList, Buckets: buckets})
+	case name == "" && r.Method == http.MethodPost:
+		var req api.CreateBucket
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !validBucketName.MatchString(req.Name) {
+			jsonError(w, http.StatusBadRequest, "INVALID_ARGUMENT", "invalid bucket name")
+			return
+		}
+		status := http.StatusCreated
+		if f.buckets[req.Name] {
+			status = http.StatusOK
+		}
+		f.buckets[req.Name] = true
+		writeJSON(w, status, api.Bucket{Kind: api.KindBucket, Name: req.Name})
+	case name == "":
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	case !f.buckets[name]:
+		jsonError(w, http.StatusNotFound, "NOT_FOUND", "no such bucket")
+	case r.Method == http.MethodGet || r.Method == http.MethodHead:
+		writeJSON(w, http.StatusOK, api.Bucket{Kind: api.KindBucket, Name: name})
+	case r.Method == http.MethodDelete:
+		prefix := name + "/"
+		for p := range f.files {
+			if strings.HasPrefix(p, prefix) {
+				jsonError(w, http.StatusConflict, "CONFLICT", "bucket not empty")
+				return
+			}
+		}
+		for p := range f.folders {
+			if strings.HasPrefix(p, prefix) {
+				jsonError(w, http.StatusConflict, "CONFLICT", "bucket not empty")
+				return
+			}
+		}
+		delete(f.buckets, name)
+		w.WriteHeader(http.StatusNoContent)
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+	}
 }
 
 // formatTime formats t as the server does
@@ -463,6 +535,12 @@ func (f *fakeServer) list(w http.ResponseWriter, r *http.Request, resource strin
 		Offset:   offset,
 		HasMore:  end < len(entries),
 	}
+	if recursive && f.recursiveFolders {
+		result.Recursive = true
+		if offset == 0 {
+			result.Folders = f.foldersBelow(prefix)
+		}
+	}
 	for _, e := range entries[min(offset, end):end] {
 		if e.file != nil {
 			result.Files = append(result.Files, *e.file)
@@ -474,6 +552,37 @@ func (f *fakeServer) list(w http.ResponseWriter, r *http.Request, resource strin
 		result.NextPageToken = base64.RawURLEncoding.EncodeToString([]byte(strconv.Itoa(end)))
 	}
 	writeJSON(w, http.StatusOK, result)
+}
+
+// foldersBelow returns every folder below prefix at any depth
+func (f *fakeServer) foldersBelow(prefix string) []api.Folder {
+	found := map[string]bool{}
+	add := func(p string) {
+		rest, ok := strings.CutPrefix(p, prefix)
+		if !ok {
+			return
+		}
+		for i := strings.Index(rest, "/"); i >= 0; {
+			found[prefix+rest[:i+1]] = true
+			next := strings.Index(rest[i+1:], "/")
+			if next < 0 {
+				break
+			}
+			i += next + 1
+		}
+	}
+	for p := range f.files {
+		add(p)
+	}
+	for p := range f.folders {
+		add(p)
+	}
+	folders := []api.Folder{}
+	for p := range found {
+		folders = append(folders, folderResource(p))
+	}
+	sort.Slice(folders, func(i, j int) bool { return folders[i].Path < folders[j].Path })
+	return folders
 }
 
 func (f *fakeServer) download(w http.ResponseWriter, r *http.Request, resource string) {
