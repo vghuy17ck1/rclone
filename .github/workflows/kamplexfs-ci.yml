@@ -41,8 +41,11 @@ jobs:
       - name: Test
         run: go test ./backend/s3/... ./backend/kamplexfs/... ./backend/overview/... ./cmd/selfupdate/...
 
-      - name: Cross compile
-        run: |
-          GOOS=windows GOARCH=amd64 go build -o /dev/null .
-          GOOS=linux GOARCH=arm64 go build -o /dev/null .
-          GOOS=darwin GOARCH=arm64 go build -o /dev/null .
+      - name: Race test
+        run: go test -race ./backend/s3/... ./backend/kamplexfs/... ./cmd/selfupdate/...
+
+  # The release builds, so they are known to work before a release
+  build:
+    name: build
+    needs: test
+    uses: ./.github/workflows/kamplexfs-build.yml

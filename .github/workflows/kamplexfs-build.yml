@@ -1,0 +1,259 @@
+---
+# Build the KamPlexFS fork's release zips as upstream builds its
+# releases, and check them.
+#
+# The zips are made by upstream's bin/cross-compile.go through "make
+# cross" with the per-platform settings of the matching jobs in
+# upstream's build.yml, which are copied into the matrix below, so
+# check they still match when upstream is merged.
+#
+# It is called by kamplexfs-release.yml, which publishes the zips, and
+# by kamplexfs-ci.yml. The zips are uploaded as the artifacts zips-*.
+
+name: kamplexfs build
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Version to build, eg v1.75.1-kamplexfs.3 - the default is <VERSION>-kamplexfs.dev'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      go: ${{ steps.vars.outputs.go }}
+      version: ${{ steps.vars.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Choose versions
+        id: vars
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          echo "go=$(.github/kamplexfs/go-version.sh)" >> "$GITHUB_OUTPUT"
+          echo "version=${VERSION:-$(cat VERSION)-kamplexfs.dev}" >> "$GITHUB_OUTPUT"
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ steps.vars.outputs.go }}
+          check-latest: true
+
+      - name: Install pandoc
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pandoc
+
+      # The zips hold the manual made from this branch's docs, which
+      # has the KamPlexFS ones. rcdocs is left out as it needs a FUSE
+      # mount and the fork doesn't change the rc commands.
+      - name: Make the manual
+        run: |
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          make -o rcdocs doc
+          grep -q "type = kamplexfs" MANUAL.txt
+
+      - name: Upload the manual
+        uses: actions/upload-artifact@v7
+        with:
+          name: manual
+          path: |
+            MANUAL.txt
+            MANUAL.html
+            rclone.1
+          if-no-files-found: error
+          retention-days: 3
+
+  build:
+    name: ${{ matrix.job_name }}
+    needs: docs
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        # check.sh checks the zips were built with gotags and
+        # cgo_built, and runs those matching run, which must list the
+        # tags listed in rclone version.
+        include:
+          - job_name: linux
+            os: ubuntu-latest
+            gotags: cmount
+            build_flags: '-include "^linux/"'
+            cgo_built: '0'
+            # there is no cmount without cgo on linux, mount is used
+            listed: none
+            # the other arches run with qemu
+            run: '^linux-'
+
+          - job_name: mac_amd64
+            os: macos-latest
+            gotags: cmount
+            build_flags: '-include "^darwin/amd64" -cgo'
+            cgo_built: '1'
+            listed: cmount
+            # with Rosetta
+            run: '^osx-amd64$'
+
+          - job_name: mac_arm64
+            os: macos-latest
+            gotags: cmount
+            build_flags: '-include "^darwin/arm64" -cgo -macos-arch arm64 -cgo-cflags=-I/usr/local/include -cgo-ldflags=-L/usr/local/lib'
+            cgo_built: '1'
+            listed: cmount
+            run: '^osx-arm64$'
+
+          - job_name: windows
+            os: windows-latest
+            gotags: cmount
+            cgo: '0'
+            build_flags: '-include "^windows/"'
+            build_args: '-buildmode exe'
+            cgo_built: '0'
+            listed: cmount
+            run: '^windows-(386|amd64)$'
+
+          - job_name: other_os
+            os: ubuntu-latest
+            build_flags: '-exclude "^(windows/|darwin/|linux/)"'
+            cgo_built: '0'
+            listed: none
+            run: '^$'
+
+    env:
+      VERSION: ${{ needs.docs.outputs.version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ needs.docs.outputs.go }}
+          check-latest: true
+
+      - name: Download the manual
+        uses: actions/download-artifact@v8
+        with:
+          name: manual
+          path: .
+
+      - name: Set environment variables
+        run: |
+          echo 'GOTAGS=${{ matrix.gotags }}' >> $GITHUB_ENV
+          echo 'BUILD_FLAGS=${{ matrix.build_flags }}' >> $GITHUB_ENV
+          echo 'BUILD_ARGS=${{ matrix.build_args }}' >> $GITHUB_ENV
+          if [[ "${{ matrix.cgo }}" != "" ]]; then echo 'CGO_ENABLED=${{ matrix.cgo }}' >> $GITHUB_ENV ; fi
+
+      # cross-compile.go makes .deb and .rpm packages of the linux
+      # builds with nfpm too
+      - name: Install Libraries on Linux
+        run: |
+          make release_dep_linux
+          sudo apt-get update
+          sudo apt-get install -y qemu-user-static
+        if: matrix.job_name == 'linux'
+
+      - name: Install Libraries on macOS
+        run: |
+          # https://github.com/Homebrew/brew/issues/15621#issuecomment-1619266788
+          # https://github.com/orgs/Homebrew/discussions/4612#discussioncomment-6319008
+          unset HOMEBREW_NO_INSTALL_FROM_API
+          brew untap --force homebrew/core
+          brew untap --force homebrew/cask
+          brew untap --force aws/tap
+          brew update
+          brew install --cask macfuse
+          if [[ "${{ matrix.job_name }}" == "mac_amd64" ]] && ! /usr/bin/pgrep -q oahd; then
+            sudo softwareupdate --install-rosetta --agree-to-license
+          fi
+        if: runner.os == 'macOS'
+
+      - name: Install Libraries on Windows
+        shell: powershell
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          choco install -y winfsp zip
+          echo "CPATH=C:\Program Files\WinFsp\inc\fuse;C:\Program Files (x86)\WinFsp\inc\fuse" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          # Copy mingw32-make.exe to make.exe so the same command line
+          # can be used on Windows as on macOS and Linux
+          $path = (get-command mingw32-make.exe).Path
+          Copy-Item -Path $path -Destination (Join-Path (Split-Path -Path $path) 'make.exe')
+        if: runner.os == 'Windows'
+
+      # doc is made by the docs job
+      - name: Build
+        run: |
+          go version
+          make -o doc cross TAG="$VERSION"
+          ls -l build
+
+      - name: Check
+        run: .github/kamplexfs/check.sh "$VERSION" "${{ matrix.gotags }}" "${{ matrix.cgo_built }}" "${{ matrix.listed }}" "${{ matrix.run }}"
+
+      - name: Mount on Windows
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = "rclone-$env:VERSION-windows-amd64"
+          Expand-Archive "build\$name.zip" $env:RUNNER_TEMP
+          $exe = Join-Path $env:RUNNER_TEMP "$name\rclone.exe"
+
+          # The version resource shows in the file's properties
+          $product = (Get-Item $exe).VersionInfo.ProductVersion
+          if ($product -ne $env:VERSION.TrimStart('v')) { throw "rclone.exe has product version '$product'" }
+
+          $src = New-Item -ItemType Directory (Join-Path $env:RUNNER_TEMP "mount-src")
+          Set-Content -Path (Join-Path $src "hello.txt") -Value "hello from $env:VERSION" -NoNewline
+          $log = Join-Path $env:RUNNER_TEMP "mount.log"
+          $mount = Start-Process -FilePath $exe -PassThru -NoNewWindow -ArgumentList @(
+            "mount", $src.FullName, "X:", "--vfs-cache-mode", "off",
+            "--rc", "--rc-no-auth", "--log-file", $log, "-v")
+          try {
+            $deadline = (Get-Date).AddSeconds(60)
+            while (-not (Test-Path "X:\hello.txt")) {
+              if ($mount.HasExited) { throw "rclone mount exited" }
+              if ((Get-Date) -gt $deadline) { throw "X: wasn't mounted" }
+              Start-Sleep -Seconds 1
+            }
+            Get-ChildItem X:\ | Out-String | Write-Host
+            $content = Get-Content -Raw "X:\hello.txt"
+            if ($content -ne "hello from $env:VERSION") { throw "read '$content' from the mount" }
+
+            # quitting unmounts
+            & $exe rc core/quit
+            if ($LASTEXITCODE -ne 0) { throw "rclone rc core/quit failed" }
+            if (-not $mount.WaitForExit(60000)) { throw "rclone mount didn't quit" }
+            if (Test-Path "X:\") { throw "X: is still mounted" }
+            Write-Host "Mounted, listed, read and unmounted X:"
+          } finally {
+            if (-not $mount.HasExited) { Stop-Process -Id $mount.Id -Force }
+            Get-Content $log | Write-Host
+          }
+        if: runner.os == 'Windows'
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: zips-${{ matrix.job_name }}
+          path: build/rclone-${{ env.VERSION }}-*.zip
+          if-no-files-found: error
+          retention-days: 3
