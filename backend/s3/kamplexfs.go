@@ -451,6 +451,10 @@ func (f *Fs) kamplexfsDirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemo
 	if xml.Unmarshal(body, &result) == nil {
 		fs.Debugf(f, "KamPlexFS: renamed %d objects from %q to %q", result.ObjectsRenamed, srcFs.root+"/"+srcRemote, f.root+"/"+dstRemote)
 	}
+	if srcPrefix == "" {
+		// Moving a whole bucket leaves it behind empty
+		return srcFs.Rmdir(ctx, srcRemote)
+	}
 	return nil
 }
 
