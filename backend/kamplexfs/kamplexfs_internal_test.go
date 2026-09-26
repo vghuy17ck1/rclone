@@ -39,6 +39,11 @@ func tickingClock() func() time.Time {
 // newTestFs makes an Fs with root "bucket" talking to fake
 func newTestFs(ctx context.Context, t *testing.T, fake *fakeServer, extra configmap.Simple) (*Fs, *httptest.Server) {
 	fake.buckets["bucket"] = true
+	return newTestFsRoot(ctx, t, fake, "bucket", extra)
+}
+
+// newTestFsRoot makes an Fs with root talking to fake
+func newTestFsRoot(ctx context.Context, t *testing.T, fake *fakeServer, root string, extra configmap.Simple) (*Fs, *httptest.Server) {
 	srv := httptest.NewServer(fake)
 	t.Cleanup(srv.Close)
 	regInfo, err := fs.Find("kamplexfs")
@@ -50,7 +55,7 @@ func newTestFs(ctx context.Context, t *testing.T, fake *fakeServer, extra config
 	for k, v := range extra {
 		cfg[k] = v
 	}
-	f, err := NewFs(ctx, "TestKamPlexFSInternal", "bucket", fs.ConfigMap("kamplexfs", regInfo.Options, "TestKamPlexFSInternal", cfg))
+	f, err := NewFs(ctx, "TestKamPlexFSInternal", root, fs.ConfigMap("kamplexfs", regInfo.Options, "TestKamPlexFSInternal", cfg))
 	require.NoError(t, err)
 	f.(*Fs).tokens.now = tickingClock()
 	fake.Reset()
@@ -266,7 +271,11 @@ func TestUploadRequest(t *testing.T) {
 	o, err := f.Put(ctx, bytes.NewBufferString("hello"), src)
 	require.NoError(t, err)
 	reqs := fake.Requests()
-	require.Len(t, reqs, 1, "must not stat after the upload")
+	require.Len(t, reqs, 2, "must not stat after the upload")
+	// the bucket is made on the first upload only
+	assert.Equal(t, "POST", reqs[0].Method)
+	assert.Equal(t, "/api/v1/buckets", reqs[0].Path)
+	reqs = reqs[1:]
 	assert.Equal(t, "PUT", reqs[0].Method)
 	assert.Equal(t, "/content/bucket/dir/a b+.txt", reqs[0].Path)
 	assert.Contains(t, reqs[0].Query, "md5=5d41402abc4b2a76b9719d911017c592")
@@ -281,6 +290,7 @@ func TestUploadRequest(t *testing.T) {
 	require.NoError(t, err)
 	fake.Reset()
 	o = put(ctx, t, f, "dir/b.txt", "hello", mtime)
+	require.Len(t, fake.Requests(), 1)
 	assert.Contains(t, fake.Requests()[0].Query, "mtime=1709608272.1234567")
 	assert.True(t, mtime.Equal(o.ModTime(ctx)))
 
@@ -411,20 +421,54 @@ func TestListR(t *testing.T) {
 		})
 	}
 
-	t.Run("DirectFSKeepsEmptyFolders", func(t *testing.T) {
-		fake := newFakeServer(testSecret)
-		f, _ := newTestFs(ctx, t, fake, nil)
-		put(ctx, t, f, "a.txt", "x", time.Now())
-		require.NoError(t, f.Mkdir(ctx, "empty"))
-		var got []string
-		require.NoError(t, f.ListR(ctx, "", func(entries fs.DirEntries) error {
-			for _, e := range entries {
-				got = append(got, e.Remote())
+	// On direct-fs servers recursive listings are only used if they
+	// have every folder, so empty folders aren't left out
+	for _, test := range []struct {
+		name   string
+		marked bool
+	}{
+		{"DirectFSMarked", true},
+		{"DirectFSNotMarked", false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fake := newFakeServer(testSecret)
+			fake.recursiveFolders = test.marked
+			f, _ := newTestFs(ctx, t, fake, configmap.Simple{"list_chunk": "2"})
+			for _, p := range []string{"a.txt", "d/b.txt", "d/e/c.txt", "h/i.txt"} {
+				put(ctx, t, f, p, "x", time.Now())
 			}
-			return nil
-		}))
-		assert.ElementsMatch(t, []string{"a.txt", "empty"}, got)
-	})
+			require.NoError(t, f.Mkdir(ctx, "empty/deeper"))
+			for range 2 {
+				fake.Reset()
+				var got []string
+				require.NoError(t, f.ListR(ctx, "", func(entries fs.DirEntries) error {
+					for _, e := range entries {
+						got = append(got, e.Remote())
+					}
+					return nil
+				}))
+				assert.ElementsMatch(t, []string{"a.txt", "d", "d/b.txt", "d/e", "d/e/c.txt", "empty", "empty/deeper", "h", "h/i.txt"}, got)
+				recursive := 0
+				for _, r := range fake.Requests() {
+					if strings.Contains(r.Query, "recursive=true") {
+						recursive++
+					}
+				}
+				if test.marked {
+					assert.Equal(t, len(fake.Requests()), recursive, "must only use recursive listings")
+					assert.Len(t, fake.Requests(), 2)
+				} else {
+					assert.Greater(t, len(fake.Requests()), recursive, "must walk the folders")
+				}
+			}
+			// A recursive listing which isn't marked is only tried once
+			if !test.marked {
+				for _, r := range fake.Requests() {
+					assert.NotContains(t, r.Query, "recursive=true")
+				}
+			}
+		})
+	}
 }
 
 func TestNotFound(t *testing.T) {
@@ -439,4 +483,111 @@ func TestNotFound(t *testing.T) {
 	assert.Equal(t, fs.ErrorDirNotFound, err)
 	_, err = f.NewObject(ctx, "missing.txt")
 	assert.Equal(t, fs.ErrorObjectNotFound, err)
+}
+
+// requestPaths returns "METHOD path" for each request
+func requestPaths(fake *fakeServer) (out []string) {
+	for _, r := range fake.Requests() {
+		out = append(out, r.Method+" "+r.Path)
+	}
+	return out
+}
+
+func TestBuckets(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeServer(testSecret)
+	f, _ := newTestFsRoot(ctx, t, fake, "", nil)
+
+	// Mkdir makes the bucket once
+	require.NoError(t, f.Mkdir(ctx, "new-bucket"))
+	require.NoError(t, f.Mkdir(ctx, "new-bucket"))
+	assert.Equal(t, []string{"POST /api/v1/buckets"}, requestPaths(fake))
+	assert.True(t, fake.buckets["new-bucket"])
+
+	// Making a folder in a new bucket makes the bucket first
+	fake.Reset()
+	require.NoError(t, f.Mkdir(ctx, "other-bucket/dir"))
+	assert.Equal(t, []string{"POST /api/v1/buckets", "POST /folders"}, requestPaths(fake))
+
+	// The server rejects bad names
+	err := f.Mkdir(ctx, "Bad_Name")
+	assert.Equal(t, http.StatusBadRequest, statusCode(err))
+
+	// The root lists the buckets
+	fake.Reset()
+	entries, err := f.List(ctx, "")
+	require.NoError(t, err)
+	assert.Len(t, entries, 2)
+	assert.Equal(t, []string{"GET /api/v1/buckets"}, requestPaths(fake))
+
+	// Rmdir removes empty buckets only
+	assert.Equal(t, fs.ErrorDirectoryNotEmpty, f.Rmdir(ctx, "other-bucket"))
+	require.NoError(t, f.Rmdir(ctx, "new-bucket"))
+	assert.False(t, fake.buckets["new-bucket"])
+	assert.Equal(t, fs.ErrorDirNotFound, f.Rmdir(ctx, "new-bucket"))
+
+	// Mkdir makes it again after it was removed
+	require.NoError(t, f.Mkdir(ctx, "new-bucket"))
+	assert.True(t, fake.buckets["new-bucket"])
+
+	// Purge removes the bucket too
+	put(ctx, t, f, "new-bucket/a.txt", "x", time.Now())
+	require.NoError(t, f.Purge(ctx, "new-bucket"))
+	assert.False(t, fake.buckets["new-bucket"])
+	assert.Equal(t, fs.ErrorDirNotFound, f.Purge(ctx, "new-bucket"))
+
+	// Uploads and server-side copies make the bucket
+	o := put(ctx, t, f, "put-bucket/a.txt", "x", time.Now())
+	assert.True(t, fake.buckets["put-bucket"])
+	_, err = f.Copy(ctx, o, "copy-bucket/a.txt")
+	require.NoError(t, err)
+	assert.True(t, fake.buckets["copy-bucket"])
+}
+
+func TestBucketsRestrictedToken(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeServer(testSecret, "bucket")
+	f, _ := newTestFsRoot(ctx, t, fake, "", configmap.Simple{"allowed_methods": "GET,PUT"})
+
+	// A token which can't create buckets can still use existing ones
+	require.NoError(t, f.Mkdir(ctx, "bucket"))
+	put(ctx, t, f, "bucket/a.txt", "x", time.Now())
+
+	// but can't use missing ones
+	err := f.Mkdir(ctx, "missing")
+	assert.Equal(t, http.StatusForbidden, statusCode(err))
+}
+
+func TestBucketsOldServer(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeServer(testSecret, "bucket").oldServer()
+	f, _ := newTestFsRoot(ctx, t, fake, "", nil)
+
+	// A 404 from deleting a bucket could be the bucket or the
+	// endpoint which is missing so it must check which
+	require.NoError(t, f.Rmdir(ctx, "bucket"))
+	assert.True(t, fake.buckets["bucket"])
+
+	// Buckets can't be made so they must exist already
+	require.NoError(t, f.Mkdir(ctx, "bucket"))
+	require.NoError(t, f.Mkdir(ctx, "missing"))
+	assert.False(t, fake.buckets["missing"])
+
+	// The root lists the buckets with the file endpoints
+	entries, err := f.List(ctx, "")
+	require.NoError(t, err)
+	assert.Len(t, entries, 1)
+
+	// Buckets can't be removed so they are left
+	require.NoError(t, f.Rmdir(ctx, "bucket"))
+	assert.True(t, fake.buckets["bucket"])
+	put(ctx, t, f, "bucket/a.txt", "x", time.Now())
+	assert.Equal(t, fs.ErrorDirectoryNotEmpty, f.Rmdir(ctx, "bucket"))
+
+	// Once known the bucket endpoints aren't tried again
+	fake.Reset()
+	require.NoError(t, f.Mkdir(ctx, "another"))
+	_, err = f.List(ctx, "")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"GET /list"}, requestPaths(fake))
 }
