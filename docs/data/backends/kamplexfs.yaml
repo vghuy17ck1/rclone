@@ -1,0 +1,27 @@
+backend: kamplexfs
+name: KamPlexFS
+tier: Tier 4
+maintainers: External
+features_score: 0
+integration_tests: Passing
+data_integrity: Hash
+performance: High
+adoption: Some use
+docs: Full
+security: High
+virtual: false
+remote: 'TestKamPlexFS:'
+features:
+- BucketBased
+- BucketBasedRootOK
+- CanHaveEmptyDirectories
+- Copy
+- DirMove
+- ListR
+- Move
+- Purge
+- PutStream
+- ReadMimeType
+hashes:
+- md5
+precision: 1000000000
