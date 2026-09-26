@@ -181,11 +181,28 @@ func (f *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(sw, f.failBody)
 		return
 	}
-	if !f.authorize(sw, r, p) {
+	resource := p
+	for _, op := range []string{"/list/", "/content/"} {
+		resource = strings.TrimPrefix(resource, op)
+	}
+	if listed, ok := strings.CutPrefix(p, "/list/"); ok && !strings.HasSuffix(listed, "/") {
+		// a folder is scoped like the path "folder/"
+		resource = listed + "/"
+	}
+	bucketName := strings.TrimPrefix(strings.TrimPrefix(p, bucketsRoute), "/")
+	if isBuckets {
+		// allowed_prefixes scope a bucket like the path "name/" and
+		// the collection is only allowed to unscoped tokens
+		resource = ""
+		if bucketName != "" {
+			resource = bucketName + "/"
+		}
+	}
+	if !f.authorize(sw, r, resource) {
 		return
 	}
 	if isBuckets {
-		f.serveBuckets(sw, r, strings.TrimPrefix(strings.TrimPrefix(p, bucketsRoute), "/"))
+		f.serveBuckets(sw, r, bucketName)
 		return
 	}
 	f.serve(sw, r, p)
@@ -213,9 +230,10 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// authorize checks the JWT, writing an error and returning false if
-// it isn't acceptable.
-func (f *fakeServer) authorize(w http.ResponseWriter, r *http.Request, p string) bool {
+// authorize checks the JWT for resource, the path its allowed_prefixes
+// apply to, writing an error and returning false if it isn't
+// acceptable.
+func (f *fakeServer) authorize(w http.ResponseWriter, r *http.Request, resource string) bool {
 	tokenString, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 	if !ok {
 		plainError(w, http.StatusUnauthorized, "Invalid token")
@@ -246,10 +264,6 @@ func (f *fakeServer) authorize(w http.ResponseWriter, r *http.Request, p string)
 		return false
 	}
 	if prefixes, ok := claims["allowed_prefixes"].([]any); ok {
-		resource := p
-		for _, op := range []string{"/list/", "/content/"} {
-			resource = strings.TrimPrefix(resource, op)
-		}
 		permitted := false
 		for _, prefix := range prefixes {
 			if s, ok := prefix.(string); ok && strings.HasPrefix(resource, s) {
@@ -356,6 +370,8 @@ func (f *fakeServer) serveBuckets(w http.ResponseWriter, r *http.Request, name s
 	case r.Method == http.MethodGet || r.Method == http.MethodHead:
 		writeJSON(w, http.StatusOK, api.Bucket{Kind: api.KindBucket, Name: name})
 	case r.Method == http.MethodDelete:
+		// only files make a bucket not empty - empty folders are
+		// deleted with it
 		prefix := name + "/"
 		for p := range f.files {
 			if strings.HasPrefix(p, prefix) {
@@ -365,8 +381,7 @@ func (f *fakeServer) serveBuckets(w http.ResponseWriter, r *http.Request, name s
 		}
 		for p := range f.folders {
 			if strings.HasPrefix(p, prefix) {
-				jsonError(w, http.StatusConflict, "CONFLICT", "bucket not empty")
-				return
+				delete(f.folders, p)
 			}
 		}
 		delete(f.buckets, name)

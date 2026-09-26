@@ -122,8 +122,10 @@ Older servers without the bucket endpoints can't make or remove
 buckets, so there the buckets must be made on the server first and
 are left in place when emptied.
 
-A token which isn't allowed to make buckets can still use the ones
-which exist.
+Listing and making buckets needs a token without `allowed_prefixes`.
+A token which can't make buckets, because of `allowed_prefixes` or
+`allowed_methods`, can still use the existing buckets it covers, so
+put the bucket in the remote's path, for example `remote:bucket`.
 
 ### Modification times and hashes
 

@@ -660,6 +660,12 @@ func (f *Fs) hasBucketAPI(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 	_, err := f.listBuckets(ctx)
+	if statusCode(err) == http.StatusForbidden {
+		// Listing the buckets needs an unscoped token so the
+		// endpoint is there but this token can't use it
+		f.server.bucketAPI.Store(stateYes)
+		return true, nil
+	}
 	if err != nil {
 		return false, err
 	}
@@ -969,16 +975,12 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 	if bucket == "" {
 		return nil
 	}
-	if directory == "" && f.server.bucketAPI.Load() != stateNo {
-		err := f.removeBucket(ctx, bucket)
-		if err != errNoBucketAPI {
-			return err
-		}
-	}
 	if f.server.noFolders.Load() && directory != "" {
 		// folders only exist while they hold objects
 		return nil
 	}
+	// The server deletes a bucket holding only empty folders along
+	// with them so this checks for folders too.
 	empty, err := f.isEmpty(ctx, bucket, directory)
 	if err != nil {
 		return err
@@ -987,7 +989,14 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 		return fs.ErrorDirectoryNotEmpty
 	}
 	if directory == "" {
-		return nil
+		if f.server.bucketAPI.Load() == stateNo {
+			return nil
+		}
+		err = f.removeBucket(ctx, bucket)
+		if err == errNoBucketAPI {
+			return nil
+		}
+		return err
 	}
 	// FIXME an object uploaded between the check and the delete is deleted too
 	_, err = f.delete(ctx, dirPath(bucket, directory))
