@@ -520,8 +520,10 @@ func TestBuckets(t *testing.T) {
 	assert.Len(t, entries, 2)
 	assert.Equal(t, []string{"GET /api/v1/buckets"}, requestPaths(fake))
 
-	// Rmdir removes empty buckets only
+	// Rmdir removes empty buckets only, although the server would
+	// delete one holding only empty folders
 	assert.Equal(t, fs.ErrorDirectoryNotEmpty, f.Rmdir(ctx, "other-bucket"))
+	assert.True(t, fake.buckets["other-bucket"])
 	require.NoError(t, f.Rmdir(ctx, "new-bucket"))
 	assert.False(t, fake.buckets["new-bucket"])
 	assert.Equal(t, fs.ErrorDirNotFound, f.Rmdir(ctx, "new-bucket"))
@@ -556,6 +558,51 @@ func TestBucketsRestrictedToken(t *testing.T) {
 	// but can't use missing ones
 	err := f.Mkdir(ctx, "missing")
 	assert.Equal(t, http.StatusForbidden, statusCode(err))
+}
+
+func TestBucketsScopedToken(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeServer(testSecret, "bucket", "other")
+	f, _ := newTestFsRoot(ctx, t, fake, "", configmap.Simple{"allowed_prefixes": "bucket/,gone/"})
+
+	// Listing and making buckets needs an unscoped token
+	_, err := f.List(ctx, "")
+	assert.Equal(t, http.StatusForbidden, statusCode(err))
+
+	// but a scoped token can use the buckets in its scope
+	fake.Reset()
+	require.NoError(t, f.Mkdir(ctx, "bucket"))
+	assert.Equal(t, []string{"POST /api/v1/buckets", "GET /api/v1/buckets/bucket"}, requestPaths(fake))
+	put(ctx, t, f, "bucket/a.txt", "x", time.Now())
+	assert.Equal(t, fs.ErrorDirectoryNotEmpty, f.Rmdir(ctx, "bucket"))
+	delete(fake.files, "bucket/a.txt")
+	require.NoError(t, f.Rmdir(ctx, "bucket"))
+	assert.False(t, fake.buckets["bucket"])
+
+	// A missing bucket is found to be missing although the token
+	// can't list the buckets to see the endpoints are there
+	assert.Equal(t, fs.ErrorDirNotFound, f.removeBucket(ctx, "gone"))
+
+	// and it can't use those out of its scope
+	_, err = f.List(ctx, "other")
+	assert.Equal(t, http.StatusForbidden, statusCode(err))
+}
+
+func TestBucketsEmptyFolders(t *testing.T) {
+	ctx := context.Background()
+	fake := newFakeServer(testSecret, "bucket")
+	f, _ := newTestFsRoot(ctx, t, fake, "", nil)
+
+	// The server deletes a bucket holding only empty folders
+	require.NoError(t, f.Mkdir(ctx, "bucket/dir"))
+	require.NoError(t, f.removeBucket(ctx, "bucket"))
+	assert.False(t, fake.buckets["bucket"])
+	assert.Empty(t, fake.folders)
+
+	// so Purge can remove it
+	require.NoError(t, f.Mkdir(ctx, "bucket/dir"))
+	require.NoError(t, f.Purge(ctx, "bucket"))
+	assert.False(t, fake.buckets["bucket"])
 }
 
 func TestBucketsOldServer(t *testing.T) {
