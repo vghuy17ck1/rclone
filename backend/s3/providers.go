@@ -78,6 +78,7 @@ var providerFS embed.FS
 // addProvidersToInfo adds provider information to the fs.RegInfo
 func addProvidersToInfo(info *fs.RegInfo) *fs.RegInfo {
 	providerMap := loadProviders()
+	info.Options = append(info.Options, kamplexfsOptions...)
 	providerList := constructProviders(info.Options, providerMap)
 	info.Description += strings.TrimSuffix(providerList, ", ")
 	return info
