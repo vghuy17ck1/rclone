@@ -77,6 +77,7 @@ var cmdSelfUpdate = &cobra.Command{
 		}
 		gotActionFlags := Opt.Stable || Opt.Beta || Opt.Output != "" || Opt.Version != "" || Opt.Package != "zip"
 		if Opt.Check && !gotActionFlags {
+			kamplexfsCheckNote()
 			versionCmd.CheckVersion(ctx)
 			return
 		}
@@ -147,6 +148,9 @@ func GetVersion(ctx context.Context, beta bool, version string) (newVersion, sit
 
 // InstallUpdate performs rclone self-update
 func InstallUpdate(ctx context.Context, opt *Options) error {
+	if err := kamplexfsGuard(opt); err != nil {
+		return err
+	}
 	// Find the latest release number
 	if opt.Stable && opt.Beta {
 		return errors.New("--stable and --beta are mutually exclusive")
