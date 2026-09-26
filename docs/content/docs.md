@@ -64,6 +64,7 @@ See the following for detailed instructions for
 - [Internet Archive](/internetarchive/)
 - [Internxt](/internxt/)
 - [Jottacloud](/jottacloud/)
+- [KamPlexFS](/kamplexfs/)
 - [Koofr](/koofr/)
 - [Linkbox](/linkbox/)
 - [Mail.ru Cloud](/mailru/)
