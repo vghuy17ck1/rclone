@@ -1,0 +1,149 @@
+---
+# Bring upstream rclone changes into the KamPlexFS fork
+#
+# Run it by hand from the Actions tab. See KAMPLEXFS.md for when to
+# use each mode.
+#
+# Pushing upstream changes to .github/workflows needs a token with the
+# "workflows" permission, which the default GITHUB_TOKEN doesn't have.
+# Put a fine-grained personal access token with Contents, Pull
+# requests and Workflows read/write on this repository in the
+# KAMPLEXFS_SYNC_TOKEN secret. Pushes made with it also start the
+# release and CI workflows, which pushes made with GITHUB_TOKEN don't.
+
+name: kamplexfs sync upstream
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'merge: merge an upstream tag or branch into an existing branch. new-stable: start a new stable branch from an upstream tag with the fork commits cherry-picked onto it.'
+        type: choice
+        options:
+          - merge
+          - new-stable
+        default: merge
+      upstream_ref:
+        description: 'Upstream tag or branch, e.g. v1.75.2, v1.75-stable or master'
+        required: true
+        type: string
+      branch:
+        description: 'Fork branch to update or create, e.g. kamplexfs/v1.75-stable or kamplexfs/master'
+        required: true
+        type: string
+      from_branch:
+        description: 'new-stable only: fork branch to take the fork commits from, e.g. kamplexfs/v1.75-stable'
+        required: false
+        type: string
+      open_pr:
+        description: 'merge only: open a pull request instead of pushing to the branch'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+concurrency:
+  group: kamplexfs-sync-${{ inputs.branch }}
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: ${{ inputs.mode }} ${{ inputs.upstream_ref }} into ${{ inputs.branch }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      GH_TOKEN: ${{ secrets.KAMPLEXFS_SYNC_TOKEN || github.token }}
+      MODE: ${{ inputs.mode }}
+      UPSTREAM_REF: ${{ inputs.upstream_ref }}
+      BRANCH: ${{ inputs.branch }}
+      FROM_BRANCH: ${{ inputs.from_branch }}
+      OPEN_PR: ${{ inputs.open_pr }}
+      HAS_SYNC_TOKEN: ${{ secrets.KAMPLEXFS_SYNC_TOKEN != '' }}
+    steps:
+      - name: Check inputs
+        run: |
+          [[ "$BRANCH" == kamplexfs/* ]] || { echo "::error::branch must start with kamplexfs/"; exit 1; }
+          if [[ "$MODE" == new-stable ]]; then
+            [[ "$BRANCH" =~ ^kamplexfs/v[0-9]+\.[0-9]+-stable$ ]] || { echo "::error::new-stable branch must be like kamplexfs/v1.76-stable"; exit 1; }
+            [[ -n "$FROM_BRANCH" ]] || { echo "::error::new-stable needs from_branch"; exit 1; }
+          fi
+          if [[ "$HAS_SYNC_TOKEN" != true ]]; then
+            echo "::warning::KAMPLEXFS_SYNC_TOKEN isn't set - pushing upstream changes to .github/workflows will fail"
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.KAMPLEXFS_SYNC_TOKEN || github.token }}
+
+      - name: Configure git
+        run: |
+          # Merges are made by whoever ran the workflow
+          git config user.name "${{ github.actor }}"
+          git config user.email "${{ github.actor_id }}+${{ github.actor }}@users.noreply.github.com"
+
+      - name: Sync
+        run: |
+          if [[ "$MODE" == merge ]]; then
+            .github/kamplexfs/sync-upstream.sh merge "$UPSTREAM_REF" "$BRANCH"
+          else
+            .github/kamplexfs/sync-upstream.sh new-stable "$UPSTREAM_REF" "$BRANCH" "$FROM_BRANCH"
+          fi
+          echo "HEAD=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Check for changes
+        id: changes
+        run: |
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null && [[ "$(git rev-parse "origin/$BRANCH")" == "$HEAD" ]]; then
+            echo "Nothing to do"
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Go
+        if: steps.changes.outputs.changed == 'true'
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Test
+        if: steps.changes.outputs.changed == 'true'
+        run: |
+          go build ./...
+          go vet ./backend/s3/... ./backend/kamplexfs/...
+          go test ./backend/s3/... ./backend/kamplexfs/... ./backend/overview/...
+
+      - name: Open pull request
+        if: steps.changes.outputs.changed == 'true' && inputs.mode == 'merge' && inputs.open_pr
+        run: |
+          pr_branch="sync/${BRANCH#kamplexfs/}-${UPSTREAM_REF//\//-}-${GITHUB_RUN_ID}"
+          git push origin "HEAD:refs/heads/$pr_branch"
+          {
+            echo "Merges upstream rclone \`$UPSTREAM_REF\` into \`$BRANCH\`."
+            echo
+            echo "The fork's tests passed on the merge. Merging this pull request releases it if \`$BRANCH\` is a stable branch."
+            echo
+            echo "Upstream commits:"
+            echo
+            git log --no-merges --format='- %s (%h)' "origin/$BRANCH..HEAD" | head -200
+          } > body.md
+          gh pr create --base "$BRANCH" --head "$pr_branch" \
+            --title "Merge upstream rclone $UPSTREAM_REF into $BRANCH" \
+            --body-file body.md
+
+      - name: Push
+        if: steps.changes.outputs.changed == 'true' && !(inputs.mode == 'merge' && inputs.open_pr)
+        run: |
+          git push origin "HEAD:refs/heads/$BRANCH"
+          # Pushes made with GITHUB_TOKEN don't start other workflows
+          # so start the release explicitly. It skips commits which
+          # are already released.
+          if [[ "$BRANCH" =~ ^kamplexfs/v[0-9]+\.[0-9]+-stable$ ]]; then
+            gh workflow run kamplexfs-release.yml --ref "$BRANCH"
+          fi
