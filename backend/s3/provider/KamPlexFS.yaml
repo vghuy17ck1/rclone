@@ -1,0 +1,15 @@
+name: KamPlexFS
+description: KamPlexFS Object Storage
+region:
+  '': |-
+    Use this if unsure.
+    Will use v4 signatures and an empty region.
+endpoint: {}
+quirks:
+  list_version: 2
+  force_path_style: true
+  list_url_encode: false # the server ignores encoding-type=url
+  use_multipart_etag: false # multipart ETags are whole-object MD5s
+  use_already_exists: false
+  # a server-side copy is cheap and has no 5 GiB limit so never use UploadPartCopy
+  copy_cutoff: 9223372036854775807

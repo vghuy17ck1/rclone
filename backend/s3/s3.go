@@ -1171,6 +1171,7 @@ type Fs struct {
 	versioningMu   sync.Mutex
 	versioning     fs.Tristate // if set bucket is using versions
 	warnCompressed sync.Once   // warn once about compressed files
+	kpx            *kamplexfs  // KamPlexFS provider state, nil for other providers
 }
 
 // Object describes a s3 object
@@ -1932,6 +1933,9 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	}
 	if opt.Provider == "Rabata" {
 		f.features.Copy = nil
+	}
+	if err := f.kamplexfsSetup(ctx, m); err != nil {
+		return nil, err
 	}
 	if opt.Provider == "TencentCOS" && strings.Contains(opt.Endpoint, "cos.accelerate.myqcloud.com") {
 		// Global Acceleration endpoint does not support bucket creation.
@@ -3003,6 +3007,9 @@ func (f *Fs) Rmdir(ctx context.Context, dir string) error {
 
 // Precision of the remote
 func (f *Fs) Precision() time.Duration {
+	if p := f.kamplexfsPrecision(); p != 0 {
+		return p
+	}
 	return time.Nanosecond
 }
 
@@ -4206,6 +4213,9 @@ func (o *Object) ModTime(ctx context.Context) time.Time {
 	if o.fs.ci.UseServerModTime {
 		return o.lastModified
 	}
+	if modTime, ok := o.kamplexfsModTime(); ok {
+		return modTime
+	}
 	err := o.readMetaData(ctx)
 	if err != nil {
 		fs.Logf(o, "Failed to read metadata: %v", err)
@@ -4235,6 +4245,7 @@ func (o *Object) SetModTime(ctx context.Context, modTime time.Time) error {
 	if err != nil {
 		return err
 	}
+	modTime = o.fs.kamplexfsTruncateMtime(modTime)
 	o.meta[metaMtime] = swift.TimeToFloatString(modTime)
 
 	// Can't update metadata here, so return this error to force a recopy
@@ -4976,6 +4987,7 @@ func (o *Object) prepareUpload(ctx context.Context, src fs.ObjectInfo, options [
 	}
 
 	// Set the mtime in the meta data
+	modTime = o.fs.kamplexfsTruncateMtime(modTime)
 	ui.req.Metadata[metaMtime] = swift.TimeToFloatString(modTime)
 
 	// read the md5sum if available
