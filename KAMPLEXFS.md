@@ -29,6 +29,15 @@ request. It runs the fork's tests, builds portable zips and publishes
 a GitHub release. It never runs for `kamplexfs/master` or any other
 branch.
 
+The zips are built by `.github/workflows/kamplexfs-build.yml` the way
+upstream builds its releases: upstream's `bin/cross-compile.go` run by
+`make cross`, with the build tags, cgo settings and FUSE libraries of
+each job in upstream's `build.yml`. So `rclone mount` is built in
+everywhere upstream has it, with `-tags cmount` on Windows and macOS.
+The CI workflow runs the same build on every push to
+`kamplexfs/master`, so a release build is known to work before it is
+needed.
+
 - Releases are tagged `<upstream version>-kamplexfs.<N>`, e.g.
   `v1.75.1-kamplexfs.1`, `v1.75.1-kamplexfs.2`, ... and
   `v1.75.2-kamplexfs.1` once upstream v1.75.2 is merged. The upstream
@@ -37,10 +46,17 @@ branch.
 - A commit which is already released isn't released again, so the
   workflow can be re-run from the Actions tab safely.
 - The zips are laid out like the official ones, with `rclone` (or
-  `rclone.exe`), `README.txt`, `README.html` and `rclone.1`, for
-  windows amd64/arm64/386, linux amd64/arm64/386/arm-v7/arm-v6, macOS
-  (`osx`) amd64/arm64 and freebsd amd64, plus `SHA256SUMS`. There are
-  no .deb/.rpm packages.
+  `rclone.exe`), `README.txt`, `README.html` and `rclone.1`, for every
+  platform upstream releases (windows, macOS (`osx`), linux, freebsd,
+  netbsd, openbsd, plan9, solaris and aix), plus `SHA256SUMS`. The
+  README is the manual made from this branch's docs by
+  `make -o rcdocs doc`. There are no .deb/.rpm packages.
+- Before anything is published `.github/kamplexfs/check.sh` checks
+  every zip's contents, version, build tags, cgo setting and KamPlexFS
+  support, and runs those the runner can (linux ones with qemu) to
+  check `rclone version`, `rclone help backends` and
+  `rclone mount --help`. On Windows it mounts a directory as `X:`,
+  reads it and unmounts it.
 - `rclone selfupdate` installs official rclone, which would replace
   the build and lose the KamPlexFS support, so it refuses to run
   unless given `--force-upstream-update`. `rclone selfupdate --check`
@@ -50,10 +66,14 @@ branch.
   `v1.75.1-kamplexfs.2.md`, and are put at the top of the release
   notes followed by the list of commits since the last release.
 
-To build a zip locally:
+To build and check zips locally (this needs pandoc, and nfpm from
+`make release_dep_linux` for linux):
 
 ```sh
-.github/kamplexfs/package.sh v1.75.1-kamplexfs.0 linux amd64
+make -o rcdocs doc
+make -o doc cross TAG=v1.75.1-kamplexfs.0 BUILD_FLAGS='-include "^linux/amd64"' GOTAGS=cmount
+.github/kamplexfs/check.sh v1.75.1-kamplexfs.0 cmount 0 none '^linux-amd64$'
+git checkout -- MANUAL.* rclone.1 docs cmd lib
 ```
 
 ## Bringing in upstream changes
@@ -119,6 +139,7 @@ only places a merge can conflict:
   the command and `kamplexfsGuard` in `InstallUpdate`
 - `docs/content/s3.md` and `docs/content/docs.md`: the KamPlexFS
   entries
+- `bin/make_manual.py`: `kamplexfs.md` in the list of docs
 
 Upstream's own workflows only run in `rclone/rclone`, so they are
 skipped in this fork.
