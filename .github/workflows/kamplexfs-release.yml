@@ -84,10 +84,10 @@ jobs:
         run: go build ./...
 
       - name: Vet
-        run: go vet ./backend/s3/... ./backend/kamplexfs/...
+        run: go vet ./backend/s3/... ./backend/kamplexfs/... ./cmd/selfupdate/...
 
       - name: Test
-        run: go test ./backend/s3/... ./backend/kamplexfs/... ./backend/overview/...
+        run: go test ./backend/s3/... ./backend/kamplexfs/... ./backend/overview/... ./cmd/selfupdate/...
 
   build:
     name: build ${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.goarm && format('-v{0}', matrix.goarm) || '' }}
@@ -168,8 +168,12 @@ jobs:
           {
             echo "rclone ${version} with KamPlexFS support (\`provider = KamPlexFS\` in the s3 backend and \`type = kamplexfs\`)."
             echo
-            echo "Portable builds only - unzip and run. Don't use \`rclone selfupdate\` as it installs the official rclone."
+            echo "Portable builds only - unzip and run. \`rclone selfupdate\` refuses to replace this build with official rclone unless given \`--force-upstream-update\`."
             echo
+            if [[ -f ".github/kamplexfs/release-notes/${TAG}.md" ]]; then
+              cat ".github/kamplexfs/release-notes/${TAG}.md"
+              echo
+            fi
             if [[ -n "$since" ]]; then
               echo "## Changes since ${previous:-upstream ${version}}"
               echo

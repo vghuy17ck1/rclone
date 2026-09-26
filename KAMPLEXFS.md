@@ -41,8 +41,14 @@ branch.
   windows amd64/arm64/386, linux amd64/arm64/386/arm-v7/arm-v6, macOS
   (`osx`) amd64/arm64 and freebsd amd64, plus `SHA256SUMS`. There are
   no .deb/.rpm packages.
-- Don't use `rclone selfupdate` with these builds as it installs the
-  official rclone.
+- `rclone selfupdate` installs official rclone, which would replace
+  the build and lose the KamPlexFS support, so it refuses to run
+  unless given `--force-upstream-update`. `rclone selfupdate --check`
+  still works but the versions it reports are upstream releases.
+- Notes for a release go in
+  `.github/kamplexfs/release-notes/<tag>.md`, e.g.
+  `v1.75.1-kamplexfs.2.md`, and are put at the top of the release
+  notes followed by the list of commits since the last release.
 
 To build a zip locally:
 
@@ -95,6 +101,7 @@ The fork's code is kept out of upstream files as far as possible:
 - `backend/s3/kamplexfs.go`, `backend/s3/kamplexfs_test.go` and
   `backend/s3/provider/KamPlexFS.yaml` - the s3 provider
 - `backend/kamplexfs/` - the JSON backend
+- `cmd/selfupdate/kamplexfs.go` and its test - the `selfupdate` guard
 - `docs/content/kamplexfs.md`, `docs/data/backends/kamplexfs.yaml`
 - `.github/kamplexfs/`, `.github/workflows/kamplexfs-*.yml` and this
   file
@@ -108,6 +115,8 @@ only places a merge can conflict:
 - `backend/s3/providers.go`: appending `kamplexfsOptions` in
   `addProvidersToInfo`
 - `backend/all/all.go`: the import of `backend/kamplexfs`
+- `cmd/selfupdate/selfupdate.go`: the calls to `kamplexfsCheckNote` in
+  the command and `kamplexfsGuard` in `InstallUpdate`
 - `docs/content/s3.md` and `docs/content/docs.md`: the KamPlexFS
   entries
 
@@ -119,12 +128,16 @@ skipped in this fork.
 The fork's unit tests need no server:
 
 ```sh
-go test ./backend/s3/ ./backend/kamplexfs/
+go test ./backend/s3/ ./backend/kamplexfs/ ./cmd/selfupdate/
 ```
+
+Set `CI=1` to skip upstream's `selfupdate` tests which download
+rclone.
 
 They include rclone's full backend conformance suite run against an
 in-memory fake of the JSON API in direct-fs, packed-volume and
-pre-upgrade server modes.
+pre-upgrade server modes. The first two make and remove their own
+buckets.
 
 To run the conformance suite against a real server, configure the
 remotes `TestKamPlexFS` (`type = kamplexfs`) and `TestS3KamPlexFS`
