@@ -1,0 +1,48 @@
+---
+# Test the KamPlexFS fork's code on the development branch and on
+# pull requests into the fork's branches. Releases are made by
+# kamplexfs-release.yml instead.
+
+name: kamplexfs ci
+
+on:
+  push:
+    branches:
+      - 'kamplexfs/master'
+  pull_request:
+    branches:
+      - 'kamplexfs/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./backend/s3/... ./backend/kamplexfs/...
+
+      - name: Test
+        run: go test ./backend/s3/... ./backend/kamplexfs/... ./backend/overview/...
+
+      - name: Cross compile
+        run: |
+          GOOS=windows GOARCH=amd64 go build -o /dev/null .
+          GOOS=linux GOARCH=arm64 go build -o /dev/null .
+          GOOS=darwin GOARCH=arm64 go build -o /dev/null .

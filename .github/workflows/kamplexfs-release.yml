@@ -1,0 +1,189 @@
+---
+# Release the KamPlexFS fork of rclone
+#
+# Every push to a kamplexfs/vX.Y-stable branch (a new commit or a
+# merged pull request) is tested, built for the portable targets below
+# and published as a GitHub release tagged <VERSION>-kamplexfs.<N>,
+# where VERSION is the upstream version in the VERSION file and N
+# counts the fork's releases of that version.
+#
+# It never runs for kamplexfs/master or any other branch. A commit
+# which already has a release tag is not released again.
+
+name: kamplexfs release
+
+on:
+  push:
+    branches:
+      - 'kamplexfs/v*-stable'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Releases are made one at a time so the release numbers don't clash
+concurrency:
+  group: kamplexfs-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: prepare
+    if: startsWith(github.ref_name, 'kamplexfs/v') && endsWith(github.ref_name, '-stable')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      skip: ${{ steps.tag.outputs.skip }}
+      go: ${{ steps.go.outputs.go }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Choose release tag
+        id: tag
+        run: |
+          version=$(cat VERSION)
+          existing=$(git tag --points-at HEAD --list "v*-kamplexfs.*")
+          if [[ -n "$existing" ]]; then
+            echo "HEAD is already released as $existing - skipping"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          last=$(git tag --list "${version}-kamplexfs.*" | sed 's/.*-kamplexfs\.//' | sort -n | tail -1)
+          tag="${version}-kamplexfs.$(( ${last:-0} + 1 ))"
+          echo "Releasing $tag"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+
+      - name: Choose Go version
+        id: go
+        run: |
+          # The latest patch release of the Go version in go.mod
+          echo "go=~$(sed -n 's/^go \([0-9]*\.[0-9]*\).*/\1/p' go.mod)" >> "$GITHUB_OUTPUT"
+
+  test:
+    name: test
+    needs: prepare
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ needs.prepare.outputs.go }}
+          check-latest: true
+
+      - name: Build
+        run: go build ./...
+
+      - name: Vet
+        run: go vet ./backend/s3/... ./backend/kamplexfs/...
+
+      - name: Test
+        run: go test ./backend/s3/... ./backend/kamplexfs/... ./backend/overview/...
+
+  build:
+    name: build ${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.goarm && format('-v{0}', matrix.goarm) || '' }}
+    needs: [prepare, test]
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - {goos: windows, goarch: amd64}
+          - {goos: windows, goarch: arm64}
+          - {goos: windows, goarch: '386'}
+          - {goos: linux, goarch: amd64}
+          - {goos: linux, goarch: arm64}
+          - {goos: linux, goarch: '386'}
+          - {goos: linux, goarch: arm, goarm: '7'}
+          - {goos: linux, goarch: arm, goarm: '6'}
+          - {goos: darwin, goarch: amd64}
+          - {goos: darwin, goarch: arm64}
+          - {goos: freebsd, goarch: amd64}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ needs.prepare.outputs.go }}
+          check-latest: true
+
+      - name: Build and package
+        run: .github/kamplexfs/package.sh "${{ needs.prepare.outputs.tag }}" "${{ matrix.goos }}" "${{ matrix.goarch }}" "${{ matrix.goarm }}"
+
+      - name: Upload
+        uses: actions/upload-artifact@v7
+        with:
+          name: zip-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm }}
+          path: build/*.zip
+          if-no-files-found: error
+          retention-days: 3
+
+  release:
+    name: release
+    needs: [prepare, build]
+    if: needs.prepare.outputs.skip != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Download
+        uses: actions/download-artifact@v8
+        with:
+          pattern: zip-*
+          path: build
+          merge-multiple: true
+
+      - name: Write checksums and release notes
+        env:
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          (cd build && sha256sum *.zip > SHA256SUMS && cat SHA256SUMS)
+          version=$(cat VERSION)
+          previous=$(git describe --tags --abbrev=0 --match "v*-kamplexfs.*" HEAD 2>/dev/null || true)
+          if [[ -n "$previous" ]]; then
+            since=$previous
+          else
+            # the upstream release commit this branch is based on
+            since=$(git log -1 --format=%H --grep="^Version ${version}\$" HEAD)
+          fi
+          {
+            echo "rclone ${version} with KamPlexFS support (\`provider = KamPlexFS\` in the s3 backend and \`type = kamplexfs\`)."
+            echo
+            echo "Portable builds only - unzip and run. Don't use \`rclone selfupdate\` as it installs the official rclone."
+            echo
+            if [[ -n "$since" ]]; then
+              echo "## Changes since ${previous:-upstream ${version}}"
+              echo
+              git log --no-merges --format='- %s (%h)' "${since}..HEAD" | head -300
+            fi
+          } > notes.md
+          cat notes.md
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          gh release create "$TAG" build/*.zip build/SHA256SUMS \
+            --target "$GITHUB_SHA" \
+            --title "rclone $TAG" \
+            --notes-file notes.md
