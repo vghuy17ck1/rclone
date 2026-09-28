@@ -2,9 +2,16 @@ package s3
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"fmt"
+	"html"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -31,12 +38,21 @@ type kamplexfsRequest struct {
 	Header http.Header
 }
 
+// kamplexfsObject is an object stored by the fake server
+type kamplexfsObject struct {
+	size         int64
+	etag         string
+	lastModified time.Time
+	meta         http.Header // the X-Amz-Meta-* headers
+}
+
 // kamplexfsFake is a fake KamPlexFS S3 server mounted under /s3/
 type kamplexfsFake struct {
 	t        *testing.T
 	srv      *httptest.Server
 	mu       sync.Mutex
 	requests []kamplexfsRequest
+	objects  map[string]*kamplexfsObject // keyed by bucket/key
 
 	// responses, keyed by the query operation
 	capsStatus   int
@@ -54,6 +70,7 @@ func newKamPlexFSFake(t *testing.T, tls bool) *kamplexfsFake {
 		capsBody:     kamplexfsAllFeatures,
 		renameStatus: http.StatusOK,
 		prefixStatus: http.StatusOK,
+		objects:      map[string]*kamplexfsObject{},
 	}
 	if tls {
 		k.srv = httptest.NewTLSServer(k)
@@ -117,6 +134,7 @@ func (k *kamplexfsFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	q := r.URL.Query()
+	bucket, key, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/s3/"), "/")
 	switch {
 	case q.Has("kamplexfsCapabilities"):
 		if k.capsStatus != http.StatusOK {
@@ -130,6 +148,14 @@ func (k *kamplexfsFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeS3Error(w, k.renameStatus, k.renameCode)
 			return
 		}
+		src, err := url.PathUnescape(strings.TrimPrefix(r.Header.Get("X-Amz-Rename-Source"), "/"))
+		require.NoError(k.t, err)
+		k.mu.Lock()
+		if o, ok := k.objects[src]; ok {
+			delete(k.objects, src)
+			k.objects[bucket+"/"+key] = o
+		}
+		k.mu.Unlock()
 		w.WriteHeader(http.StatusOK)
 	case q.Has("kamplexfsRenamePrefix"):
 		if k.prefixStatus != http.StatusOK {
@@ -139,12 +165,115 @@ func (k *kamplexfsFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`<RenamePrefixResult><ObjectsRenamed>42</ObjectsRenamed></RenamePrefixResult>`))
 	case q.Has("uploads"):
 		_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><InitiateMultipartUploadResult><Bucket>bucket</Bucket><Key>key</Key><UploadId>upload-id</UploadId></InitiateMultipartUploadResult>`))
+	case r.Method == http.MethodGet && key == "" && q.Get("list-type") == "2":
+		k.list(w, bucket, q.Get("prefix"), q.Get("delimiter"))
+	case q.Get("x-id") == "PutObject" || q.Get("x-id") == "CopyObject":
+		k.put(w, r, bucket+"/"+key)
 	case r.Method == http.MethodHead:
-		writeS3Error(w, http.StatusNotFound, "NotFound")
+		k.mu.Lock()
+		o, ok := k.objects[bucket+"/"+key]
+		k.mu.Unlock()
+		if !ok {
+			writeS3Error(w, http.StatusNotFound, "NotFound")
+			return
+		}
+		for name, values := range o.meta {
+			w.Header()[name] = values
+		}
+		w.Header().Set("Content-Length", strconv.FormatInt(o.size, 10))
+		w.Header().Set("ETag", `"`+o.etag+`"`)
+		w.Header().Set("Last-Modified", o.lastModified.UTC().Format(http.TimeFormat))
+		w.WriteHeader(http.StatusOK)
 	default:
 		// bucket creation and anything else
 		w.WriteHeader(http.StatusOK)
 	}
+}
+
+// put stores an uploaded or copied object as name
+//
+// Like the server, it reports the mtime metadata floored to whole
+// seconds as the LastModified.
+func (k *kamplexfsFake) put(w http.ResponseWriter, r *http.Request, name string) {
+	o := &kamplexfsObject{meta: http.Header{}}
+	source := r.Header.Get("X-Amz-Copy-Source")
+	if source != "" {
+		source, err := url.PathUnescape(strings.TrimPrefix(source, "/"))
+		require.NoError(k.t, err)
+		k.mu.Lock()
+		src, ok := k.objects[source]
+		k.mu.Unlock()
+		if !ok {
+			writeS3Error(w, http.StatusNotFound, "NoSuchKey")
+			return
+		}
+		*o = *src
+		o.meta = src.meta.Clone()
+	} else {
+		assert.Empty(k.t, r.Header.Get("X-Amz-Decoded-Content-Length"), "the fake can't read aws-chunked bodies")
+		body, err := io.ReadAll(r.Body)
+		require.NoError(k.t, err)
+		sum := md5.Sum(body)
+		o.size, o.etag = int64(len(body)), hex.EncodeToString(sum[:])
+	}
+	if source == "" || r.Header.Get("X-Amz-Metadata-Directive") == "REPLACE" {
+		o.meta = http.Header{}
+		for name, values := range r.Header {
+			if strings.HasPrefix(name, "X-Amz-Meta-") {
+				o.meta[name] = values
+			}
+		}
+	}
+	o.lastModified = time.Now().Truncate(time.Second)
+	if secs, _, _ := strings.Cut(o.meta.Get("X-Amz-Meta-Mtime"), "."); secs != "" {
+		n, err := strconv.ParseInt(secs, 10, 64)
+		require.NoError(k.t, err)
+		o.lastModified = time.Unix(n, 0)
+	}
+	k.mu.Lock()
+	k.objects[name] = o
+	k.mu.Unlock()
+	if source != "" {
+		_, _ = fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><CopyObjectResult><ETag>"%s"</ETag><LastModified>%s</LastModified></CopyObjectResult>`,
+			o.etag, o.lastModified.UTC().Format(time.RFC3339))
+		return
+	}
+	w.Header().Set("ETag", `"`+o.etag+`"`)
+	w.WriteHeader(http.StatusOK)
+}
+
+// list lists the objects in bucket as ListObjectsV2 does
+func (k *kamplexfsFake) list(w http.ResponseWriter, bucket, prefix, delimiter string) {
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	var names, dirs []string
+	for name := range k.objects {
+		key, ok := strings.CutPrefix(name, bucket+"/")
+		if !ok || !strings.HasPrefix(key, prefix) {
+			continue
+		}
+		if i := strings.Index(key[len(prefix):], delimiter); delimiter != "" && i >= 0 {
+			dir := key[:len(prefix)+i+len(delimiter)]
+			if !slices.Contains(dirs, dir) {
+				dirs = append(dirs, dir)
+			}
+			continue
+		}
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	slices.Sort(dirs)
+	_, _ = fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>%s</Name><Prefix>%s</Prefix><KeyCount>%d</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>`,
+		html.EscapeString(bucket), html.EscapeString(prefix), len(names)+len(dirs))
+	for _, name := range names {
+		o := k.objects[name]
+		_, _ = fmt.Fprintf(w, `<Contents><Key>%s</Key><LastModified>%s</LastModified><ETag>"%s"</ETag><Size>%d</Size><StorageClass>STANDARD</StorageClass></Contents>`,
+			html.EscapeString(strings.TrimPrefix(name, bucket+"/")), o.lastModified.UTC().Format("2006-01-02T15:04:05.000Z"), o.etag, o.size)
+	}
+	for _, dir := range dirs {
+		_, _ = fmt.Fprintf(w, `<CommonPrefixes><Prefix>%s</Prefix></CommonPrefixes>`, html.EscapeString(dir))
+	}
+	_, _ = io.WriteString(w, `</ListBucketResult>`)
 }
 
 // newKamPlexFSTestFs makes an Fs talking to the fake
@@ -300,9 +429,10 @@ func TestKamPlexFSModTime(t *testing.T) {
 		assert.Equal(t, listed, o.ModTime(ctx))
 		assert.Equal(t, 0, k.count("HEAD"), "must not HEAD the object")
 
-		// mtime metadata from an upload is preferred when known
+		// mtime metadata from an upload is preferred when known, at
+		// the precision of the listings
 		o.meta = map[string]string{metaMtime: "1709608273.5"}
-		assert.Equal(t, time.Unix(1709608273, 500000000), o.ModTime(ctx))
+		assert.Equal(t, time.Unix(1709608273, 0), o.ModTime(ctx))
 		assert.Equal(t, 0, k.count("HEAD"))
 	})
 
@@ -348,6 +478,60 @@ func TestKamPlexFSUploadMtime(t *testing.T) {
 			ui, err := o.prepareUpload(ctx, src, nil, true)
 			require.NoError(t, err)
 			assert.Equal(t, test.want, ui.req.Metadata[metaMtime])
+		})
+	}
+}
+
+// TestKamPlexFSFingerprint checks an object has the same fingerprint
+// whether it comes from an upload, a move, a copy, a HEAD or a
+// listing, as the VFS cache drops a file whose fingerprint changes.
+func TestKamPlexFSFingerprint(t *testing.T) {
+	ctx := context.Background()
+	mtime := time.Unix(1709608272, 123456789)
+	for _, test := range []struct {
+		name  string
+		caps  string
+		extra configmap.Simple
+		want  time.Time
+	}{
+		{"MtimeNanos", kamplexfsAllFeatures, nil, time.Unix(1709608272, 0)},
+		{"OldServer", `{"features":["rename-object"]}`, nil, time.Unix(1709608272, 0)},
+		{"Exact", kamplexfsAllFeatures, configmap.Simple{"kamplexfs_exact_modtime": "true"}, mtime},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			k := newKamPlexFSFake(t, false)
+			k.capsBody = test.caps
+			f := newKamPlexFSTestFs(ctx, t, k.endpoint(), kamplexfsProvider, test.extra)
+			require.True(t, f.opt.NoHead, "uploads must build the object without a HEAD")
+			put := func(remote string) fs.Object {
+				src := object.NewStaticObjectInfo(remote, mtime, 5, true, nil, nil)
+				o, err := f.Put(ctx, strings.NewReader("hello"), src)
+				require.NoError(t, err)
+				return o
+			}
+
+			uploaded := put("uploaded.txt")
+			moved, err := f.Features().Move(ctx, put("src.txt"), "moved.txt")
+			require.NoError(t, err)
+			copied, err := f.Features().Copy(ctx, uploaded, "copied.txt")
+			require.NoError(t, err)
+			headed, err := f.NewObject(ctx, "uploaded.txt")
+			require.NoError(t, err)
+
+			entries, err := f.List(ctx, "")
+			require.NoError(t, err)
+			listed := map[string]fs.Object{}
+			for _, entry := range entries {
+				listed[entry.Remote()] = entry.(fs.Object)
+			}
+			assert.Len(t, listed, 3)
+			for _, o := range []fs.Object{uploaded, moved, copied, headed} {
+				l := listed[o.Remote()]
+				require.NotNil(t, l, o.Remote())
+				assert.True(t, test.want.Equal(o.ModTime(ctx)), "%s: got %v want %v", o.Remote(), o.ModTime(ctx), test.want)
+				assert.Equal(t, fs.Fingerprint(ctx, l, false), fs.Fingerprint(ctx, o, false), o.Remote())
+				assert.Equal(t, fs.Fingerprint(ctx, l, true), fs.Fingerprint(ctx, o, true), o.Remote())
+			}
 		})
 	}
 }

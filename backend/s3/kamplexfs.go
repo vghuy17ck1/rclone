@@ -318,9 +318,9 @@ func (f *Fs) kamplexfsTruncateMtime(t time.Time) time.Time {
 // kamplexfsModTime returns the modification time without a HEAD
 // request and true, or false if the stock method should be used.
 //
-// The server reports the client's mtime as the LastModified in
-// listings and HEAD, so that is used unless the mtime metadata is
-// already known, for example just after an upload.
+// The server reports the client's mtime floored to whole seconds as
+// the LastModified in listings and HEAD, so that is used unless the
+// mtime metadata is already known, for example just after an upload.
 func (o *Object) kamplexfsModTime() (time.Time, bool) {
 	if o.fs.kpx == nil || o.fs.kpx.exactModTime {
 		return time.Time{}, false
@@ -328,7 +328,10 @@ func (o *Object) kamplexfsModTime() (time.Time, bool) {
 	if d, ok := o.meta[metaMtime]; ok {
 		modTime, err := swift.FloatStringToTime(d)
 		if err == nil {
-			return modTime, true
+			// The metadata may have a fraction which the listings
+			// don't, and fs.Fingerprint uses the full mtime so the
+			// VFS cache would drop the file as changed.
+			return modTime.Truncate(time.Second), true
 		}
 		fs.Debugf(o, "Failed to read mtime from metadata: %v", err)
 	}
