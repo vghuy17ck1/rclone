@@ -369,6 +369,51 @@ func TestSetModTimeFallback(t *testing.T) {
 	assert.Len(t, old.Requests(), 1, "must remember the server can't set mtimes")
 }
 
+// TestFingerprint checks a file has the same fingerprint whether it
+// comes from an upload, a move, a copy, a read or a listing, as the
+// VFS cache drops a file whose fingerprint changes.
+func TestFingerprint(t *testing.T) {
+	ctx := context.Background()
+	mtime := time.Unix(1709608272, 123456789)
+	for _, test := range []struct {
+		name  string
+		fake  *fakeServer
+		nanos bool
+		want  time.Time
+	}{
+		{"Nanos", newFakeServer(testSecret), true, mtime},
+		{"OldServer", newFakeServer(testSecret).oldServer(), false, time.Unix(1709608272, 0)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			f, _ := newTestFs(ctx, t, test.fake, nil)
+			// as after a listing with sub-second mtimes
+			f.server.mtimeNanos.Store(test.nanos)
+
+			uploaded := put(ctx, t, f, "uploaded.txt", "hello", mtime)
+			moved, err := f.Move(ctx, put(ctx, t, f, "src.txt", "hello", mtime), "moved.txt")
+			require.NoError(t, err)
+			copied, err := f.Copy(ctx, uploaded, "copied.txt")
+			require.NoError(t, err)
+			read, err := f.NewObject(ctx, "uploaded.txt")
+			require.NoError(t, err)
+
+			entries, err := f.List(ctx, "")
+			require.NoError(t, err)
+			listed := map[string]fs.Object{}
+			for _, entry := range entries {
+				listed[entry.Remote()] = entry.(fs.Object)
+			}
+			assert.Len(t, listed, 3)
+			for _, o := range []fs.Object{uploaded, moved, copied, read} {
+				l := listed[o.Remote()]
+				require.NotNil(t, l, o.Remote())
+				assert.True(t, test.want.Equal(o.ModTime(ctx)), "%s: got %v want %v", o.Remote(), o.ModTime(ctx), test.want)
+				assert.Equal(t, fs.Fingerprint(ctx, l, false), fs.Fingerprint(ctx, o, false), o.Remote())
+			}
+		})
+	}
+}
+
 func TestListR(t *testing.T) {
 	ctx := context.Background()
 	for _, test := range []struct {
