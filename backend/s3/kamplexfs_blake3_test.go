@@ -246,14 +246,18 @@ func TestKamPlexFSBlake3Upload(t *testing.T) {
 	ctx := context.Background()
 	big := bytes.Repeat([]byte("0123456789abcdef"), 6*1024*1024/16)
 	multipart := configmap.Simple{"upload_cutoff": "5M", "chunk_size": "5M"}
+	multipartNoHead := configmap.Simple{"upload_cutoff": "5M", "chunk_size": "5M", "no_head": "true"}
+	multipartNoChecksum := configmap.Simple{"upload_cutoff": "5M", "chunk_size": "5M", "disable_checksum": "true"}
 	for _, test := range []struct {
-		name    string
-		md5     bool
-		pending bool
-		wrong   bool
-		extra   configmap.Simple
-		data    []byte
-		wantErr bool
+		name     string
+		md5      bool
+		pending  bool
+		wrong    bool
+		extra    configmap.Simple
+		data     []byte
+		wantErr  bool
+		heads    int  // HEAD requests made by the upload
+		noDigest bool // the upload doesn't find the BLAKE3
 	}{
 		{name: "OK", md5: true, data: []byte("hello")},
 		{name: "BLAKE3Only", data: []byte("hello")},
@@ -261,8 +265,10 @@ func TestKamPlexFSBlake3Upload(t *testing.T) {
 		{name: "MismatchBLAKE3Only", wrong: true, data: []byte("hello"), wantErr: true},
 		{name: "Pending", md5: true, pending: true, wrong: true, data: []byte("hello")},
 		{name: "DisableChecksum", md5: true, wrong: true, extra: configmap.Simple{"disable_checksum": "true"}, data: []byte("hello")},
-		{name: "Multipart", md5: true, extra: multipart, data: big},
+		{name: "Multipart", md5: true, extra: multipart, data: big, heads: 1},
 		{name: "MultipartMismatch", wrong: true, extra: multipart, data: big, wantErr: true},
+		{name: "MultipartNoHead", md5: true, extra: multipartNoHead, data: big, noDigest: true},
+		{name: "MultipartDisableChecksum", md5: true, extra: multipartNoChecksum, data: big, noDigest: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			k := newKamPlexFSBlake3Fake(t, test.md5)
@@ -279,11 +285,12 @@ func TestKamPlexFSBlake3Upload(t *testing.T) {
 			if test.extra["upload_cutoff"] != "" {
 				require.NotNil(t, k.find("uploadId"), "must be a multipart upload")
 			}
+			assert.Equal(t, test.heads, k.count("HEAD"))
 			k.reset()
 			digest, err := o.Hash(ctx, hash.BLAKE3)
 			require.NoError(t, err)
 			switch {
-			case test.pending:
+			case test.pending || test.noDigest:
 				assert.Empty(t, digest)
 			case test.wrong:
 				assert.Equal(t, strings.Repeat("0", 64), digest)
@@ -304,6 +311,26 @@ func TestKamPlexFSBlake3Upload(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestKamPlexFSBlake3UpdateNoHead checks a multipart upload with
+// no_head doesn't keep the BLAKE3 of the data it replaced.
+func TestKamPlexFSBlake3UpdateNoHead(t *testing.T) {
+	ctx := context.Background()
+	k := newKamPlexFSBlake3Fake(t, true)
+	f := newKamPlexFSTestFs(ctx, t, k.endpoint(), kamplexfsProvider, configmap.Simple{"upload_cutoff": "5M", "chunk_size": "5M", "no_head": "true"})
+	o, err := putData(ctx, f, "file.bin", []byte("hello"))
+	require.NoError(t, err)
+	digest, err := o.Hash(ctx, hash.BLAKE3)
+	require.NoError(t, err)
+	require.Equal(t, blake3Hex([]byte("hello")), digest)
+
+	big := bytes.Repeat([]byte("0123456789abcdef"), 6*1024*1024/16)
+	src := object.NewStaticObjectInfo("file.bin", time.Unix(1709608272, 0), int64(len(big)), true, nil, nil)
+	require.NoError(t, o.Update(ctx, bytes.NewReader(big), src))
+	digest, err = o.Hash(ctx, hash.BLAKE3)
+	require.NoError(t, err)
+	assert.Empty(t, digest)
 }
 
 // TestKamPlexFSBlake3Sync syncs from a local directory to a server

@@ -4760,7 +4760,6 @@ func (w *s3ChunkWriter) Close(ctx context.Context) (err error) {
 		if resp.VersionId != nil {
 			w.versionID = *resp.VersionId
 		}
-		w.o.kamplexfsSetBlake3(resp.ResultMetadata)
 	}
 	fs.Debugf(w.o, "multipart upload %q finished", *w.uploadID)
 	return err
@@ -4778,7 +4777,7 @@ func (o *Object) uploadMultipart(ctx context.Context, src fs.ObjectInfo, in io.R
 	s3cw := chunkWriter.(*s3ChunkWriter)
 	gotETag = *stringClone(s3cw.eTag)
 	versionID = stringClone(s3cw.versionID)
-	o.blake3 = s3cw.o.blake3
+	o.blake3 = "" // CompleteMultipartUpload doesn't return it
 
 	hashOfHashes := md5.Sum(s3cw.md5s)
 	wantETag = fmt.Sprintf("%s-%d", hex.EncodeToString(hashOfHashes[:]), len(s3cw.completedParts))
@@ -5169,7 +5168,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	// so make up the object as best we can assuming it got
 	// uploaded properly. If size < 0 then we need to do the HEAD.
 	var head *s3.HeadObjectOutput
-	if o.fs.opt.NoHead && size >= 0 {
+	if o.fs.opt.NoHead && size >= 0 && !o.fs.kamplexfsHeadUpload(uploadHash, multipart) {
 		head = new(s3.HeadObjectOutput)
 		//structs.SetFrom(head, &req)
 		setFrom_s3HeadObjectOutput_s3PutObjectInput(head, ui.req)
