@@ -4,9 +4,11 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"html"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -44,6 +46,7 @@ type kamplexfsObject struct {
 	etag         string
 	lastModified time.Time
 	meta         http.Header // the X-Amz-Meta-* headers
+	blake3       string      // "" if not computed
 }
 
 // kamplexfsFake is a fake KamPlexFS S3 server mounted under /s3/
@@ -53,6 +56,13 @@ type kamplexfsFake struct {
 	mu       sync.Mutex
 	requests []kamplexfsRequest
 	objects  map[string]*kamplexfsObject // keyed by bucket/key
+	uploads  map[string]*kamplexfsUpload // multipart uploads keyed by bucket/key
+
+	// hashing, as set by enable_md5 and enable_blake3
+	noMD5         bool // ETags aren't MD5s
+	blake3        bool // BLAKE3 digests are computed
+	blake3Pending bool // BLAKE3 digests aren't computed inline
+	blake3Wrong   bool // upload responses have a wrong BLAKE3
 
 	// responses, keyed by the query operation
 	capsStatus   int
@@ -71,6 +81,7 @@ func newKamPlexFSFake(t *testing.T, tls bool) *kamplexfsFake {
 		renameStatus: http.StatusOK,
 		prefixStatus: http.StatusOK,
 		objects:      map[string]*kamplexfsObject{},
+		uploads:      map[string]*kamplexfsUpload{},
 	}
 	if tls {
 		k.srv = httptest.NewTLSServer(k)
@@ -163,7 +174,16 @@ func (k *kamplexfsFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		_, _ = w.Write([]byte(`<RenamePrefixResult><ObjectsRenamed>42</ObjectsRenamed></RenamePrefixResult>`))
+	case r.Method == http.MethodGet && key == "" && q.Has("kamplexfsHashes"):
+		k.listHashes(w, r, bucket)
+	case q.Get("x-id") == "UploadPart":
+		k.uploadPart(w, r, bucket+"/"+key)
+	case r.Method == http.MethodPost && q.Has("uploadId"):
+		k.completeUpload(w, bucket+"/"+key)
 	case q.Has("uploads"):
+		k.mu.Lock()
+		k.uploads[bucket+"/"+key] = &kamplexfsUpload{meta: metaHeaders(r.Header), parts: map[int][]byte{}}
+		k.mu.Unlock()
 		_, _ = w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?><InitiateMultipartUploadResult><Bucket>bucket</Bucket><Key>key</Key><UploadId>upload-id</UploadId></InitiateMultipartUploadResult>`))
 	case r.Method == http.MethodGet && key == "" && q.Get("list-type") == "2":
 		k.list(w, bucket, q.Get("prefix"), q.Get("delimiter"))
@@ -182,6 +202,9 @@ func (k *kamplexfsFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Length", strconv.FormatInt(o.size, 10))
 		w.Header().Set("ETag", `"`+o.etag+`"`)
+		if o.blake3 != "" {
+			w.Header().Set(kamplexfsBlake3Header, o.blake3)
+		}
 		w.Header().Set("Last-Modified", o.lastModified.UTC().Format(http.TimeFormat))
 		w.WriteHeader(http.StatusOK)
 	default:
@@ -191,9 +214,6 @@ func (k *kamplexfsFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // put stores an uploaded or copied object as name
-//
-// Like the server, it reports the mtime metadata floored to whole
-// seconds as the LastModified.
 func (k *kamplexfsFake) put(w http.ResponseWriter, r *http.Request, name string) {
 	o := &kamplexfsObject{meta: http.Header{}}
 	source := r.Header.Get("X-Amz-Copy-Source")
@@ -213,17 +233,79 @@ func (k *kamplexfsFake) put(w http.ResponseWriter, r *http.Request, name string)
 		assert.Empty(k.t, r.Header.Get("X-Amz-Decoded-Content-Length"), "the fake can't read aws-chunked bodies")
 		body, err := io.ReadAll(r.Body)
 		require.NoError(k.t, err)
-		sum := md5.Sum(body)
-		o.size, o.etag = int64(len(body)), hex.EncodeToString(sum[:])
+		k.setData(o, body)
 	}
 	if source == "" || r.Header.Get("X-Amz-Metadata-Directive") == "REPLACE" {
-		o.meta = http.Header{}
-		for name, values := range r.Header {
-			if strings.HasPrefix(name, "X-Amz-Meta-") {
-				o.meta[name] = values
-			}
+		o.meta = metaHeaders(r.Header)
+	}
+	k.store(w, name, o, source != "")
+}
+
+// metaHeaders returns the X-Amz-Meta-* headers
+func metaHeaders(header http.Header) http.Header {
+	meta := http.Header{}
+	for name, values := range header {
+		if strings.HasPrefix(name, "X-Amz-Meta-") {
+			meta[name] = values
 		}
 	}
+	return meta
+}
+
+// blake3Hex returns the BLAKE3 of data
+func blake3Hex(data []byte) string {
+	mh, _ := hash.NewMultiHasherTypes(hash.NewHashSet(hash.BLAKE3))
+	_, _ = mh.Write(data)
+	return mh.Sums()[hash.BLAKE3]
+}
+
+// setData sets the size and hashes of o from its data as the server
+// does with its hashing configuration.
+func (k *kamplexfsFake) setData(o *kamplexfsObject, data []byte) {
+	sum := md5.Sum(data)
+	o.size, o.etag = int64(len(data)), hex.EncodeToString(sum[:])
+	b3 := blake3Hex(data)
+	if k.blake3 && !k.blake3Pending {
+		o.blake3 = b3
+	}
+	if k.noMD5 {
+		if k.blake3 {
+			o.etag = "b3-" + b3
+		} else {
+			o.etag = "nohash-" + b3[:32]
+		}
+	}
+}
+
+// uploadHeaders sets the headers of an upload response for o
+func (k *kamplexfsFake) uploadHeaders(w http.ResponseWriter, o *kamplexfsObject) {
+	switch {
+	case o.blake3 == "":
+	case k.blake3Wrong:
+		w.Header().Set(kamplexfsBlake3Header, strings.Repeat("0", 64))
+	default:
+		w.Header().Set(kamplexfsBlake3Header, o.blake3)
+	}
+}
+
+// store stores o as name and writes the response
+func (k *kamplexfsFake) store(w http.ResponseWriter, name string, o *kamplexfsObject, copied bool) {
+	k.storeObject(o, name)
+	if copied {
+		_, _ = fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><CopyObjectResult><ETag>"%s"</ETag><LastModified>%s</LastModified></CopyObjectResult>`,
+			o.etag, o.lastModified.UTC().Format(time.RFC3339))
+		return
+	}
+	k.uploadHeaders(w, o)
+	w.Header().Set("ETag", `"`+o.etag+`"`)
+	w.WriteHeader(http.StatusOK)
+}
+
+// storeObject stores o as name
+//
+// Like the server, it reports the mtime metadata floored to whole
+// seconds as the LastModified.
+func (k *kamplexfsFake) storeObject(o *kamplexfsObject, name string) {
 	o.lastModified = time.Now().Truncate(time.Second)
 	if secs, _, _ := strings.Cut(o.meta.Get("X-Amz-Meta-Mtime"), "."); secs != "" {
 		n, err := strconv.ParseInt(secs, 10, 64)
@@ -233,13 +315,99 @@ func (k *kamplexfsFake) put(w http.ResponseWriter, r *http.Request, name string)
 	k.mu.Lock()
 	k.objects[name] = o
 	k.mu.Unlock()
-	if source != "" {
-		_, _ = fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><CopyObjectResult><ETag>"%s"</ETag><LastModified>%s</LastModified></CopyObjectResult>`,
-			o.etag, o.lastModified.UTC().Format(time.RFC3339))
-		return
-	}
-	w.Header().Set("ETag", `"`+o.etag+`"`)
+}
+
+// kamplexfsUpload is a multipart upload in progress
+type kamplexfsUpload struct {
+	meta  http.Header
+	parts map[int][]byte
+}
+
+// uploadPart stores a part of the multipart upload of name
+func (k *kamplexfsFake) uploadPart(w http.ResponseWriter, r *http.Request, name string) {
+	assert.Empty(k.t, r.Header.Get("X-Amz-Decoded-Content-Length"), "the fake can't read aws-chunked bodies")
+	body, err := io.ReadAll(r.Body)
+	require.NoError(k.t, err)
+	partNumber, err := strconv.Atoi(r.URL.Query().Get("partNumber"))
+	require.NoError(k.t, err)
+	k.mu.Lock()
+	k.uploads[name].parts[partNumber] = body
+	k.mu.Unlock()
+	sum := md5.Sum(body)
+	w.Header().Set("ETag", `"`+hex.EncodeToString(sum[:])+`"`)
 	w.WriteHeader(http.StatusOK)
+}
+
+// completeUpload joins the parts of the multipart upload of name
+func (k *kamplexfsFake) completeUpload(w http.ResponseWriter, name string) {
+	k.mu.Lock()
+	upload := k.uploads[name]
+	delete(k.uploads, name)
+	k.mu.Unlock()
+	var data []byte
+	for _, partNumber := range slices.Sorted(maps.Keys(upload.parts)) {
+		data = append(data, upload.parts[partNumber]...)
+	}
+	o := &kamplexfsObject{meta: upload.meta}
+	k.setData(o, data)
+	o.etag += fmt.Sprintf("-%d", len(upload.parts))
+	k.uploadHeaders(w, o)
+	bucket, key, _ := strings.Cut(name, "/")
+	k.storeObject(o, name)
+	_, _ = fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><CompleteMultipartUploadResult><Bucket>%s</Bucket><Key>%s</Key><ETag>"%s"</ETag></CompleteMultipartUploadResult>`,
+		html.EscapeString(bucket), html.EscapeString(key), o.etag)
+}
+
+// listHashes is the bulk listing of the BLAKE3 digests
+func (k *kamplexfsFake) listHashes(w http.ResponseWriter, r *http.Request, bucket string) {
+	q := r.URL.Query()
+	prefix, delimiter, token := q.Get("prefix"), q.Get("delimiter"), q.Get("continuation-token")
+	maxKeys, err := strconv.Atoi(q.Get("max-keys"))
+	require.NoError(k.t, err)
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	var keys, dirs []string
+	for name := range k.objects {
+		key, ok := strings.CutPrefix(name, bucket+"/")
+		if !ok || !strings.HasPrefix(key, prefix) || key <= token {
+			continue
+		}
+		if i := strings.Index(key[len(prefix):], delimiter); delimiter != "" && i >= 0 {
+			if dir := key[:len(prefix)+i+len(delimiter)]; !slices.Contains(dirs, dir) {
+				dirs = append(dirs, dir)
+			}
+			continue
+		}
+		keys = append(keys, key)
+	}
+	slices.Sort(keys)
+	slices.Sort(dirs)
+	type entry struct {
+		Key          string  `json:"key"`
+		Size         int64   `json:"size"`
+		ETag         string  `json:"etag"`
+		LastModified string  `json:"lastModified"`
+		Blake3       *string `json:"blake3"`
+	}
+	resp := struct {
+		Objects               []entry  `json:"objects"`
+		CommonPrefixes        []string `json:"commonPrefixes"`
+		NextContinuationToken *string  `json:"nextContinuationToken"`
+	}{Objects: []entry{}, CommonPrefixes: dirs}
+	for i, key := range keys {
+		if i == maxKeys {
+			resp.NextContinuationToken = &resp.Objects[i-1].Key
+			break
+		}
+		o := k.objects[bucket+"/"+key]
+		e := entry{Key: key, Size: o.size, ETag: o.etag, LastModified: o.lastModified.UTC().Format(time.RFC3339)}
+		if o.blake3 != "" {
+			e.Blake3 = &o.blake3
+		}
+		resp.Objects = append(resp.Objects, e)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	require.NoError(k.t, json.NewEncoder(w).Encode(resp))
 }
 
 // list lists the objects in bucket as ListObjectsV2 does
