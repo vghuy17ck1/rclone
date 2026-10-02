@@ -18,17 +18,27 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"regexp"
+	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
+	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
 	v4signer "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 	"github.com/ncw/swift/v2"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
+	"github.com/rclone/rclone/fs/hash"
+	"golang.org/x/sync/semaphore"
 )
 
 const kamplexfsProvider = "KamPlexFS"
@@ -40,7 +50,13 @@ const (
 	kamplexfsFeatureSequentialMultipart = "sequential-multipart"
 	kamplexfsFeatureMtimeNanos          = "mtime-nanos"
 	kamplexfsFeatureChecksums           = "checksums"
+	kamplexfsFeatureBlake3              = "blake3"
+	kamplexfsFeatureMD5                 = "md5"
 )
+
+// kamplexfsBlake3Header carries the BLAKE3 of an object in HEAD, GET
+// and upload responses when the server has computed it.
+const kamplexfsBlake3Header = "X-Kamplexfs-Blake3"
 
 // kamplexfsOptions are the provider specific options
 var kamplexfsOptions = []fs.Option{{
@@ -70,12 +86,27 @@ costs a HEAD request per object.`,
 	Default:  false,
 	Advanced: true,
 	Provider: kamplexfsProvider,
+}, {
+	Name: "kamplexfs_blake3_concurrency",
+	Help: `Maximum number of BLAKE3 hashes computed at once.
+
+When the server computes BLAKE3 digests, rclone hashes the data of
+each upload as it sends it and fails the upload if the digest the
+server returns is different. This limits how many uploads are hashed
+at the same moment, and so the CPU used for it.
+
+0 means the number of CPUs. Set --s3-disable-checksum to skip the
+check.`,
+	Default:  0,
+	Advanced: true,
+	Provider: kamplexfsProvider,
 }}
 
 // kamplexfsOpt holds the provider specific options
 type kamplexfsOpt struct {
-	SequentialUpload bool `config:"kamplexfs_sequential_upload"`
-	ExactModTime     bool `config:"kamplexfs_exact_modtime"`
+	SequentialUpload  bool `config:"kamplexfs_sequential_upload"`
+	ExactModTime      bool `config:"kamplexfs_exact_modtime"`
+	Blake3Concurrency int  `config:"kamplexfs_blake3_concurrency"`
 }
 
 // kamplexfsCapabilities is the response from the capabilities endpoint
@@ -92,6 +123,9 @@ type kamplexfs struct {
 	caps         kamplexfsCapabilities
 	features     map[string]bool
 	exactModTime bool // read the mtime from the metadata with 1ns precision
+	hashes       hash.Set
+	blake3       *kamplexfsBlake3Cache // nil unless the server has BLAKE3
+	hashSem      *semaphore.Weighted   // limits the BLAKE3 hashing of uploads
 }
 
 // has returns true if the server advertised the feature
@@ -205,6 +239,21 @@ func (f *Fs) kamplexfsSetup(ctx context.Context, m configmap.Mapper) error {
 	if !k.exactModTime {
 		f.features.SlowModTime = false
 	}
+	k.hashes = hash.Set(hash.MD5)
+	if k.has(kamplexfsFeatureBlake3) {
+		// Servers which list blake3 list md5 too when they serve
+		// MD5s, so MD5 is only off if blake3 is listed alone.
+		if !k.has(kamplexfsFeatureMD5) {
+			k.hashes = hash.Set(hash.None)
+		}
+		k.hashes.Add(hash.BLAKE3)
+		k.blake3 = newKamplexfsBlake3Cache()
+		n := k.opt.Blake3Concurrency
+		if n <= 0 {
+			n = runtime.NumCPU()
+		}
+		k.hashSem = semaphore.NewWeighted(int64(n))
+	}
 	if k.has(kamplexfsFeatureRenameObject) {
 		f.features.Move = f.kamplexfsMove
 	}
@@ -261,7 +310,7 @@ func (f *Fs) kamplexfsCall(ctx context.Context, method string, u *url.URL, heade
 		return nil, err
 	}
 	defer fs.CheckClose(resp.Body, &err)
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
 	if err != nil {
 		return nil, err
 	}
@@ -468,4 +517,381 @@ func kamplexfsDirPrefix(dir string) string {
 		return dir
 	}
 	return dir + "/"
+}
+
+// kamplexfsHashes returns the hashes of the server and true, or
+// false if the provider isn't KamPlexFS.
+func (f *Fs) kamplexfsHashes() (hash.Set, bool) {
+	if f.kpx == nil {
+		return 0, false
+	}
+	return f.kpx.hashes, true
+}
+
+// FingerprintHashes returns the hashes which may be used in a
+// fingerprint.
+//
+// Listings don't carry the BLAKE3, so a fingerprint with it would
+// differ between an object just uploaded and the same object listed.
+func (f *Fs) FingerprintHashes() hash.Set {
+	hashes := f.Hashes()
+	return hashes &^ hash.Set(hash.BLAKE3)
+}
+
+var _ fs.FingerprintHasher = (*Fs)(nil)
+
+// matchBlake3 matches a BLAKE3 digest as the server sends it
+var matchBlake3 = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// kamplexfsSetBlake3 sets the BLAKE3 from the response the metadata
+// came with, if there was one.
+//
+// Metadata which wasn't read from a response, for example made up
+// after an upload, leaves the BLAKE3 alone.
+func (o *Object) kamplexfsSetBlake3(metadata middleware.Metadata) {
+	if o.fs.kpx == nil {
+		return
+	}
+	if resp, ok := awsmiddleware.GetRawResponse(metadata).(*smithyhttp.Response); ok && resp.Response != nil {
+		o.kamplexfsSetBlake3FromHeader(resp.Header)
+	}
+}
+
+// kamplexfsSetBlake3FromHeader sets the BLAKE3 from a response header
+//
+// A missing header means the server hasn't computed it yet.
+func (o *Object) kamplexfsSetBlake3FromHeader(header http.Header) {
+	if o.fs.kpx == nil || o.fs.kpx.blake3 == nil {
+		return
+	}
+	digest := header.Get(kamplexfsBlake3Header)
+	if digest != "" && !matchBlake3.MatchString(digest) {
+		fs.Debugf(o, "KamPlexFS: ignoring invalid BLAKE3 %q", digest)
+		digest = ""
+	}
+	o.blake3 = digest
+}
+
+// kamplexfsBlake3 returns the BLAKE3 of the object, or "" if the
+// server hasn't computed it.
+//
+// Objects from a listing get it from a bulk listing of their
+// directory if more than one of them is asked for, and from a HEAD
+// request otherwise.
+func (o *Object) kamplexfsBlake3(ctx context.Context) (string, error) {
+	if o.fs.kpx.blake3 == nil {
+		return "", hash.ErrUnsupported
+	}
+	// If decompressing, erase the hash
+	if o.bytes < 0 {
+		return "", nil
+	}
+	// Uploads, HEAD and GET responses have set it already
+	if o.blake3 != "" || o.meta != nil {
+		return o.blake3, nil
+	}
+	bucket, key := o.split()
+	digest, found := o.fs.kpx.blake3.lookup(ctx, o, bucket, key)
+	if found {
+		o.blake3 = digest
+		return digest, nil
+	}
+	err := o.readMetaData(ctx)
+	if err != nil {
+		return "", err
+	}
+	return o.blake3, nil
+}
+
+// kamplexfsUploadHash hashes the data of an upload with BLAKE3
+type kamplexfsUploadHash struct {
+	ctx context.Context
+	in  io.Reader
+	sem *semaphore.Weighted
+	mh  *hash.MultiHasher
+}
+
+// Read reads from the upload, hashing what was read
+func (h *kamplexfsUploadHash) Read(p []byte) (n int, err error) {
+	n, err = h.in.Read(p)
+	if n > 0 {
+		if semErr := h.sem.Acquire(h.ctx, 1); semErr != nil {
+			return n, semErr
+		}
+		_, _ = h.mh.Write(p[:n])
+		h.sem.Release(1)
+	}
+	return n, err
+}
+
+// kamplexfsHashUpload returns in wrapped to hash what is uploaded
+// from it, or in and nil if the upload isn't checked.
+func (f *Fs) kamplexfsHashUpload(ctx context.Context, in io.Reader) (io.Reader, *kamplexfsUploadHash) {
+	if f.kpx == nil || f.kpx.blake3 == nil || f.opt.DisableChecksum {
+		return in, nil
+	}
+	mh, err := hash.NewMultiHasherTypes(hash.NewHashSet(hash.BLAKE3))
+	if err != nil {
+		fs.Debugf(f, "KamPlexFS: not checking uploads: %v", err)
+		return in, nil
+	}
+	// Hash inside the accounting so the upload code still finds it
+	in, wrap := accounting.UnWrap(in)
+	h := &kamplexfsUploadHash{ctx: ctx, in: in, sem: f.kpx.hashSem, mh: mh}
+	return wrap(h), h
+}
+
+// kamplexfsCheckUpload returns an error if the BLAKE3 of the data
+// uploaded differs from the one the server returned.
+func (o *Object) kamplexfsCheckUpload(h *kamplexfsUploadHash) error {
+	// The server only returns it if it hashed the data inline
+	if h == nil || o.blake3 == "" {
+		return nil
+	}
+	sent := h.mh.Sums()[hash.BLAKE3]
+	if sent != o.blake3 {
+		return fmt.Errorf("upload corrupted: BLAKE3 differ: sent %s but server has %s", sent, o.blake3)
+	}
+	fs.Debugf(o, "BLAKE3 of upload: %s OK", sent)
+	return nil
+}
+
+// Limits of the BLAKE3 cache
+const (
+	// kamplexfsBlake3TTL is how long digests from a bulk listing are
+	// used for
+	kamplexfsBlake3TTL = time.Minute
+	// kamplexfsBlake3Max is the most digests cached at once
+	kamplexfsBlake3Max = 100000
+	// kamplexfsBlake3PageSize is the most digests asked for at once
+	kamplexfsBlake3PageSize = 1000
+)
+
+// kamplexfsBlake3Cache holds the BLAKE3 digests from bulk listings
+// until they are asked for.
+//
+// A directory is bulk listed the second time one of its objects is
+// asked for within kamplexfsBlake3TTL, so a single object costs a
+// HEAD request and hashing a whole directory costs a request per
+// kamplexfsBlake3PageSize objects.
+type kamplexfsBlake3Cache struct {
+	mu      sync.Mutex
+	fetches map[string]*kamplexfsBlake3Fetch // bulk listings by bucket and directory
+	digests map[string]kamplexfsBlake3Digest // digests by bucket and key
+	misses  map[string]time.Time             // last miss by bucket and directory
+	now     func() time.Time                 // for testing
+}
+
+// kamplexfsBlake3Fetch is a bulk listing of a directory
+type kamplexfsBlake3Fetch struct {
+	done    chan struct{} // closed when the listing has finished
+	expires time.Time     // when the digests stop being used
+	err     error         // error the listing stopped with
+}
+
+// kamplexfsBlake3Digest is a digest from a bulk listing
+type kamplexfsBlake3Digest struct {
+	fetch        *kamplexfsBlake3Fetch
+	size         int64
+	etag         string    // "" if not known
+	lastModified time.Time // zero if not known
+	blake3       string    // "" if not computed
+}
+
+// kamplexfsHashList is the response to a bulk listing
+type kamplexfsHashList struct {
+	Objects []struct {
+		Key          string  `json:"key"`
+		Size         int64   `json:"size"`
+		ETag         string  `json:"etag"`
+		LastModified string  `json:"lastModified"`
+		Blake3       *string `json:"blake3"`
+	} `json:"objects"`
+	NextContinuationToken *string `json:"nextContinuationToken"`
+}
+
+// newKamplexfsBlake3Cache makes an empty kamplexfsBlake3Cache
+func newKamplexfsBlake3Cache() *kamplexfsBlake3Cache {
+	return &kamplexfsBlake3Cache{
+		fetches: map[string]*kamplexfsBlake3Fetch{},
+		digests: map[string]kamplexfsBlake3Digest{},
+		misses:  map[string]time.Time{},
+		now:     time.Now,
+	}
+}
+
+// expired returns true if the listing has finished and its digests
+// are too old to use.
+func (fetch *kamplexfsBlake3Fetch) expired(now time.Time) bool {
+	return !fetch.expires.IsZero() && now.After(fetch.expires)
+}
+
+// lookup returns the BLAKE3 of the object o, which is bucket/key, and
+// true if a bulk listing had it, or false if it should be read with
+// a HEAD request.
+func (c *kamplexfsBlake3Cache) lookup(ctx context.Context, o *Object, bucket, key string) (digest string, found bool) {
+	c.mu.Lock()
+	now := c.now()
+	dir := key[:strings.LastIndex(key, "/")+1]
+	dirKey := bucket + "/" + dir
+	fetch := c.fetches[dirKey]
+	if fetch != nil && fetch.expired(now) {
+		fetch = nil
+	}
+	if fetch == nil {
+		if last, ok := c.misses[dirKey]; !ok || now.Sub(last) > kamplexfsBlake3TTL {
+			c.misses[dirKey] = now
+			if len(c.misses) > kamplexfsBlake3PageSize {
+				c.sweep(now)
+			}
+			c.mu.Unlock()
+			return "", false
+		}
+		delete(c.misses, dirKey)
+		c.sweep(now)
+		fetch = &kamplexfsBlake3Fetch{done: make(chan struct{})}
+		c.fetches[dirKey] = fetch
+		c.mu.Unlock()
+		c.fill(ctx, o.fs, bucket, dir, fetch)
+	} else {
+		c.mu.Unlock()
+		select {
+		case <-fetch.done:
+		case <-ctx.Done():
+			return "", false
+		}
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	d, ok := c.digests[bucket+"/"+key]
+	if !ok || !d.matches(o) {
+		// The object may have changed since it was listed, or the
+		// listing stopped early or failed
+		return "", false
+	}
+	// Each object is usually only asked for once
+	delete(c.digests, bucket+"/"+key)
+	return d.blake3, true
+}
+
+// matches returns true if d is for the same data as the object o
+func (d *kamplexfsBlake3Digest) matches(o *Object) bool {
+	if d.size != o.bytes {
+		return false
+	}
+	if !d.lastModified.IsZero() && !d.lastModified.Equal(o.lastModified.Truncate(time.Second)) {
+		return false
+	}
+	// o.md5 is the ETag of the object if it is an MD5
+	return d.etag == "" || o.md5 == "" || d.etag == o.md5
+}
+
+// fill bulk lists bucket/prefix into the cache and marks fetch done
+func (c *kamplexfsBlake3Cache) fill(ctx context.Context, f *Fs, bucket, prefix string, fetch *kamplexfsBlake3Fetch) {
+	var (
+		token string
+		err   error
+	)
+	defer func() {
+		c.mu.Lock()
+		fetch.err = err
+		fetch.expires = c.now().Add(kamplexfsBlake3TTL)
+		c.mu.Unlock()
+		close(fetch.done)
+	}()
+	for {
+		var list *kamplexfsHashList
+		list, err = f.kamplexfsListHashes(ctx, bucket, prefix, token)
+		if err != nil {
+			fs.Debugf(f, "KamPlexFS: failed to list BLAKE3 digests of %q: %v", bucket+"/"+prefix, err)
+			return
+		}
+		c.mu.Lock()
+		for _, object := range list.Objects {
+			d := kamplexfsBlake3Digest{
+				fetch:  fetch,
+				size:   object.Size,
+				etag:   strings.Trim(strings.ToLower(object.ETag), `"`),
+				blake3: deref(object.Blake3),
+			}
+			if !matchBlake3.MatchString(d.blake3) {
+				d.blake3 = ""
+			}
+			if object.LastModified != "" {
+				d.lastModified, err = time.Parse(time.RFC3339, object.LastModified)
+				if err != nil {
+					// Don't use a digest which can't be checked
+					fs.Debugf(f, "KamPlexFS: bad lastModified in BLAKE3 listing: %v", err)
+					err = nil
+					continue
+				}
+			}
+			c.digests[bucket+"/"+object.Key] = d
+		}
+		full := len(c.digests) >= kamplexfsBlake3Max
+		c.mu.Unlock()
+		token = deref(list.NextContinuationToken)
+		if token == "" {
+			return
+		}
+		if full {
+			// The keys not listed are read with HEAD instead
+			fs.Debugf(f, "KamPlexFS: BLAKE3 cache full in %q", bucket+"/"+prefix)
+			return
+		}
+	}
+}
+
+// sweep removes the expired listings and digests
+//
+// Call with c.mu held.
+func (c *kamplexfsBlake3Cache) sweep(now time.Time) {
+	for k, fetch := range c.fetches {
+		if fetch.expired(now) {
+			delete(c.fetches, k)
+		}
+	}
+	for k, d := range c.digests {
+		if d.fetch.expired(now) {
+			delete(c.digests, k)
+		}
+	}
+	for k, last := range c.misses {
+		if now.Sub(last) > kamplexfsBlake3TTL {
+			delete(c.misses, k)
+		}
+	}
+}
+
+// kamplexfsListHashes reads a page of the bulk listing of the BLAKE3
+// digests of the objects in bucket directly under prefix.
+func (f *Fs) kamplexfsListHashes(ctx context.Context, bucket, prefix, token string) (*kamplexfsHashList, error) {
+	if f.opt.Endpoint == "" {
+		return nil, errors.New("no endpoint configured")
+	}
+	query := url.Values{}
+	query.Set("prefix", prefix)
+	query.Set("delimiter", "/")
+	query.Set("max-keys", strconv.Itoa(min(int(f.opt.ListChunk), kamplexfsBlake3PageSize)))
+	if token != "" {
+		query.Set("continuation-token", token)
+	}
+	u, err := url.Parse(strings.TrimSuffix(f.opt.Endpoint, "/") + "/" + pathEscape(bucket) + "?kamplexfsHashes&" + query.Encode())
+	if err != nil {
+		return nil, err
+	}
+	var body []byte
+	err = f.pacer.Call(func() (bool, error) {
+		body, err = f.kamplexfsCall(ctx, http.MethodGet, u, nil)
+		return f.shouldRetry(ctx, err)
+	})
+	if err != nil {
+		return nil, err
+	}
+	var list kamplexfsHashList
+	err = json.Unmarshal(body, &list)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode BLAKE3 listing: %w", err)
+	}
+	return &list, nil
 }
