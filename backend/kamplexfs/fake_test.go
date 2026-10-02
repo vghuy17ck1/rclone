@@ -26,6 +26,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/ncw/swift/v2"
 	"github.com/rclone/rclone/backend/kamplexfs/api"
+	"github.com/rclone/rclone/fs/hash"
 )
 
 // fakeFile is a stored object
@@ -35,6 +36,8 @@ type fakeFile struct {
 	mtime   time.Time
 	created time.Time
 	pending bool // report the MD5 as PENDING
+	// the BLAKE3 hasn't been computed
+	blake3Pending bool
 }
 
 // fakeServer is the fake KamPlexFS server
@@ -54,6 +57,11 @@ type fakeServer struct {
 	missing404       bool // move/copy of a missing source is a 404
 	bucketAPI        bool // the bucket endpoints are supported
 	maxPage          int  // largest page size
+	// hashes listed in bucket listings, nil for an old server
+	hashes      []string
+	noMD5       bool // md5Checksum is always empty
+	blake3      bool // BLAKE3 digests are computed
+	blake3Wrong bool // upload responses have a wrong BLAKE3
 
 	mu       sync.Mutex
 	nextID   int
@@ -205,6 +213,7 @@ func (f *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.serveBuckets(sw, r, bucketName)
 		return
 	}
+
 	f.serve(sw, r, p)
 }
 
@@ -294,7 +303,7 @@ func (f *fakeServer) serve(w http.ResponseWriter, r *http.Request, p string) {
 			buckets = append(buckets, b)
 		}
 		sort.Strings(buckets)
-		writeJSON(w, http.StatusOK, api.BucketList{Kind: api.KindBucketList, Buckets: buckets})
+		writeJSON(w, http.StatusOK, api.BucketList{Kind: api.KindBucketList, Buckets: buckets, Hashes: f.hashes})
 		return
 	case p == "/folders" && r.Method == http.MethodPost:
 		f.createFolder(w, r)
@@ -350,7 +359,7 @@ func (f *fakeServer) serveBuckets(w http.ResponseWriter, r *http.Request, name s
 			buckets = append(buckets, b)
 		}
 		sort.Strings(buckets)
-		writeJSON(w, http.StatusOK, api.BucketList{Kind: api.KindBucketList, Buckets: buckets})
+		writeJSON(w, http.StatusOK, api.BucketList{Kind: api.KindBucketList, Buckets: buckets, Hashes: f.hashes})
 	case name == "" && r.Method == http.MethodPost:
 		var req api.CreateBucket
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil || !validBucketName.MatchString(req.Name) {
@@ -410,19 +419,30 @@ func (f *fakeServer) fileResource(p string, file *fakeFile) api.File {
 	if file.pending {
 		md5sum = "PENDING"
 	}
+	if f.noMD5 {
+		md5sum = "NOT_COMPUTED"
+	}
+	var blake3 *string
+	if f.blake3 && !file.blake3Pending {
+		mh, _ := hash.NewMultiHasherTypes(hash.NewHashSet(hash.BLAKE3))
+		_, _ = mh.Write(file.data)
+		digest := mh.Sums()[hash.BLAKE3]
+		blake3 = &digest
+	}
 	return api.File{
-		Kind:         api.KindFile,
-		ID:           strconv.Itoa(file.id),
-		Name:         name,
-		Path:         p,
-		ParentPath:   parent,
-		Size:         int64(len(file.data)),
-		MimeType:     mimeType(name),
-		MD5Checksum:  md5sum,
-		CreatedTime:  f.formatTime(file.created),
-		ModifiedTime: f.formatTime(file.mtime),
-		CreatedAt:    file.created.Unix(),
-		UpdatedAt:    file.mtime.Unix(),
+		Kind:           api.KindFile,
+		ID:             strconv.Itoa(file.id),
+		Name:           name,
+		Path:           p,
+		ParentPath:     parent,
+		Size:           int64(len(file.data)),
+		MimeType:       mimeType(name),
+		MD5Checksum:    md5sum,
+		Blake3Checksum: blake3,
+		CreatedTime:    f.formatTime(file.created),
+		ModifiedTime:   f.formatTime(file.mtime),
+		CreatedAt:      file.created.Unix(),
+		UpdatedAt:      file.mtime.Unix(),
 	}
 }
 
@@ -659,7 +679,12 @@ func (f *fakeServer) upload(w http.ResponseWriter, r *http.Request, resource str
 	}
 	file.data, file.mtime = data, mtime
 	f.addParents(resource)
-	writeJSON(w, status, f.fileResource(resource, file))
+	info := f.fileResource(resource, file)
+	if f.blake3Wrong && info.Blake3Checksum != nil {
+		wrong := strings.Repeat("0", 64)
+		info.Blake3Checksum = &wrong
+	}
+	writeJSON(w, status, info)
 }
 
 func (f *fakeServer) setModTime(w http.ResponseWriter, r *http.Request, resource string) {
