@@ -8,6 +8,14 @@ import (
 	"github.com/rclone/rclone/fs/hash"
 )
 
+// FingerprintHasher is an optional interface for Fs
+type FingerprintHasher interface {
+	// FingerprintHashes returns the hashes which may be used in a
+	// fingerprint, if an object may not have all of Hashes() every
+	// time it is read, for example only some of them in listings.
+	FingerprintHashes() hash.Set
+}
+
 // Fingerprint produces a unique-ish string for an object.
 //
 // This is for detecting whether an object has changed since we last
@@ -42,7 +50,11 @@ func Fingerprint(ctx context.Context, o ObjectInfo, fast bool) string {
 	}
 	// Eg don't do this for SFTP/local where hashes are expensive?
 	if !fast || !features.SlowHash {
-		hashType := f.Hashes().GetOne()
+		hashes := f.Hashes()
+		if do, ok := f.(FingerprintHasher); ok {
+			hashes = do.FingerprintHashes()
+		}
+		hashType := hashes.GetOne()
 		if hashType != hash.None {
 			hash, err := o.Hash(ctx, hashType)
 			if err == nil {
