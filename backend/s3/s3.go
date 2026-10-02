@@ -1183,6 +1183,7 @@ type Object struct {
 	fs           *Fs               // what this object is part of
 	remote       string            // The remote path
 	md5          string            // md5sum of the object
+	blake3       string            // BLAKE3 from KamPlexFS, "" if unknown or not computed
 	bytes        int64             // size of the object
 	lastModified time.Time         // Last modified
 	meta         map[string]string // The object metadata if known - may be nil - with lower case keys
@@ -3309,6 +3310,9 @@ func (f *Fs) Copy(ctx context.Context, src fs.Object, remote string) (fs.Object,
 
 // Hashes returns the supported hash sets.
 func (f *Fs) Hashes() hash.Set {
+	if hashes, ok := f.kamplexfsHashes(); ok {
+		return hashes
+	}
 	return hash.Set(hash.MD5)
 }
 
@@ -4050,6 +4054,9 @@ func (o *Object) setMD5FromEtag(etag string) {
 
 // Hash returns the Md5sum of an object returning a lowercase hex string
 func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
+	if t == hash.BLAKE3 && o.fs.kpx != nil {
+		return o.kamplexfsBlake3(ctx)
+	}
 	if t != hash.MD5 {
 		return "", hash.ErrUnsupported
 	}
@@ -4150,6 +4157,7 @@ func (o *Object) setMetaData(resp *s3.HeadObjectOutput) {
 		o.bytes = *resp.ContentLength
 	}
 	o.setMD5FromEtag(deref(resp.ETag))
+	o.kamplexfsSetBlake3(resp.ResultMetadata)
 	o.meta = s3MetadataToMap(resp.Metadata)
 	// Read MD5 from metadata if present
 	if md5sumBase64, ok := o.meta[metaMD5Hash]; ok {
@@ -4752,6 +4760,7 @@ func (w *s3ChunkWriter) Close(ctx context.Context) (err error) {
 		if resp.VersionId != nil {
 			w.versionID = *resp.VersionId
 		}
+		w.o.kamplexfsSetBlake3(resp.ResultMetadata)
 	}
 	fs.Debugf(w.o, "multipart upload %q finished", *w.uploadID)
 	return err
@@ -4769,6 +4778,7 @@ func (o *Object) uploadMultipart(ctx context.Context, src fs.ObjectInfo, in io.R
 	s3cw := chunkWriter.(*s3ChunkWriter)
 	gotETag = *stringClone(s3cw.eTag)
 	versionID = stringClone(s3cw.versionID)
+	o.blake3 = s3cw.o.blake3
 
 	hashOfHashes := md5.Sum(s3cw.md5s)
 	wantETag = fmt.Sprintf("%s-%d", hex.EncodeToString(hashOfHashes[:]), len(s3cw.completedParts))
@@ -4825,6 +4835,7 @@ func (o *Object) uploadSinglepartPutObject(ctx context.Context, req *s3.PutObjec
 	if resp != nil {
 		etag = *stringClone(deref(resp.ETag))
 		versionID = stringClonePointer(resp.VersionId)
+		o.kamplexfsSetBlake3(resp.ResultMetadata)
 	}
 	return etag, lastModified, versionID, nil
 }
@@ -4882,6 +4893,7 @@ func (o *Object) uploadSinglepartPresignedRequest(ctx context.Context, req *s3.P
 			lastModified = date
 		}
 		etag = *stringClone(resp.Header.Get("Etag"))
+		o.kamplexfsSetBlake3FromHeader(resp.Header)
 		vID := *stringClone(resp.Header.Get("x-amz-version-id"))
 		if vID != "" {
 			versionID = &vID
@@ -5121,6 +5133,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	}
 	size := src.Size()
 	multipart := size < 0 || size >= int64(o.fs.opt.UploadCutoff)
+	in, uploadHash := o.fs.kamplexfsHashUpload(ctx, in)
 
 	var wantETag string        // Multipart upload Etag to check
 	var gotETag string         // Etag we got from the upload
@@ -5180,6 +5193,11 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 		}
 	}
 	o.setMetaData(head)
+
+	err = o.kamplexfsCheckUpload(uploadHash)
+	if err != nil {
+		return err
+	}
 
 	// Check multipart upload ETag if required
 	if o.fs.opt.UseMultipartEtag.Value && !o.fs.etagIsNotMD5 && wantETag != "" && head.ETag != nil && *head.ETag != "" {
