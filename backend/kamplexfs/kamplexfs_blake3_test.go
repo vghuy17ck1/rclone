@@ -251,3 +251,45 @@ func TestBlake3Fingerprint(t *testing.T) {
 		})
 	}
 }
+
+func TestBlake3HashesOption(t *testing.T) {
+	ctx := context.Background()
+	for _, test := range []struct {
+		name   string
+		option string
+		want   hash.Set
+	}{
+		{"BLAKE3Off", "md5", hash.Set(hash.MD5)},
+		{"BLAKE3Only", "blake3", hash.Set(hash.BLAKE3)},
+		{"Both", "blake3,md5", hash.NewHashSet(hash.MD5, hash.BLAKE3)},
+		{"None", "none", hash.Set(hash.None)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			// The server says it has MD5 only
+			fake := newFakeServer(testSecret)
+			fake.hashes = []string{"md5"}
+			fake.blake3 = true
+			f, _ := newTestFs(ctx, t, fake, configmap.Simple{"hashes": test.option})
+			assert.Equal(t, test.want, f.Hashes())
+			assert.Empty(t, fake.Requests(), "must not ask the server")
+
+			o := put(ctx, t, f, "file.txt", "hello", time.Now())
+			digest, err := o.Hash(ctx, hash.BLAKE3)
+			if test.want.Contains(hash.BLAKE3) {
+				require.NoError(t, err)
+				assert.Equal(t, blake3Of("hello"), digest)
+			} else {
+				assert.ErrorIs(t, err, hash.ErrUnsupported)
+			}
+		})
+	}
+
+	t.Run("Invalid", func(t *testing.T) {
+		regInfo, err := fs.Find("kamplexfs")
+		require.NoError(t, err)
+		cfg := configmap.Simple{"url": "http://localhost:1", "hashes": "md5,sha1"}
+		_, err = NewFs(ctx, "TestKamPlexFS", "bucket", fs.ConfigMap("kamplexfs", regInfo.Options, "TestKamPlexFS", cfg))
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `"sha1" isn't md5, blake3 or none`)
+	})
+}
