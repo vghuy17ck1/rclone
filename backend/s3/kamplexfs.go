@@ -100,13 +100,27 @@ check.`,
 	Default:  0,
 	Advanced: true,
 	Provider: kamplexfsProvider,
+}, {
+	Name: "hashes",
+	Help: `Hashes to use instead of the ones the server lists.
+
+A comma separated list of md5 and blake3, or none for no hashes.
+Leave blank to use the hashes the server lists in its capabilities.
+
+For example md5 turns BLAKE3 off, saving the hashing of uploads, and
+blake3 makes rclone compare files by BLAKE3 only. Only list hashes
+the server computes, as files have no hash otherwise.`,
+	Default:  fs.CommaSepList{},
+	Advanced: true,
+	Provider: kamplexfsProvider,
 }}
 
 // kamplexfsOpt holds the provider specific options
 type kamplexfsOpt struct {
-	SequentialUpload  bool `config:"kamplexfs_sequential_upload"`
-	ExactModTime      bool `config:"kamplexfs_exact_modtime"`
-	Blake3Concurrency int  `config:"kamplexfs_blake3_concurrency"`
+	SequentialUpload  bool            `config:"kamplexfs_sequential_upload"`
+	ExactModTime      bool            `config:"kamplexfs_exact_modtime"`
+	Blake3Concurrency int             `config:"kamplexfs_blake3_concurrency"`
+	Hashes            fs.CommaSepList `config:"hashes"`
 }
 
 // kamplexfsCapabilities is the response from the capabilities endpoint
@@ -131,6 +145,32 @@ type kamplexfs struct {
 // has returns true if the server advertised the feature
 func (k *kamplexfs) has(feature string) bool {
 	return k.features[feature]
+}
+
+// hashSet returns the hashes to use, from the hashes option
+// if set or else from the capabilities.
+func (k *kamplexfs) hashSet() (hash.Set, error) {
+	if len(k.opt.Hashes) > 0 {
+		hashes := hash.Set(hash.None)
+		for _, name := range k.opt.Hashes {
+			var t hash.Type
+			err := t.Set(strings.TrimSpace(name))
+			if err != nil || (t != hash.None && t != hash.MD5 && t != hash.BLAKE3) {
+				return hashes, fmt.Errorf("hashes: %q isn't md5, blake3 or none", name)
+			}
+			hashes.Add(t)
+		}
+		return hashes, nil
+	}
+	if !k.has(kamplexfsFeatureBlake3) {
+		return hash.Set(hash.MD5), nil
+	}
+	// Servers which list blake3 list md5 too when they serve MD5s,
+	// so MD5 is only off if blake3 is listed alone.
+	if !k.has(kamplexfsFeatureMD5) {
+		return hash.Set(hash.BLAKE3), nil
+	}
+	return hash.NewHashSet(hash.MD5, hash.BLAKE3), nil
 }
 
 // kamplexfsRenamePrefixResult is the response to a prefix rename
@@ -239,14 +279,11 @@ func (f *Fs) kamplexfsSetup(ctx context.Context, m configmap.Mapper) error {
 	if !k.exactModTime {
 		f.features.SlowModTime = false
 	}
-	k.hashes = hash.Set(hash.MD5)
-	if k.has(kamplexfsFeatureBlake3) {
-		// Servers which list blake3 list md5 too when they serve
-		// MD5s, so MD5 is only off if blake3 is listed alone.
-		if !k.has(kamplexfsFeatureMD5) {
-			k.hashes = hash.Set(hash.None)
-		}
-		k.hashes.Add(hash.BLAKE3)
+	k.hashes, err = k.hashSet()
+	if err != nil {
+		return err
+	}
+	if k.hashes.Contains(hash.BLAKE3) {
 		k.blake3 = newKamplexfsBlake3Cache()
 		n := k.opt.Blake3Concurrency
 		if n <= 0 {
