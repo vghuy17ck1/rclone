@@ -290,7 +290,11 @@ func (f *Fs) kamplexfsCall(ctx context.Context, method string, u *url.URL, heade
 		req.Header.Set(k, v)
 	}
 	c := f.c.Options()
-	creds, err := c.Credentials.Retrieve(ctx)
+	var creds aws.Credentials
+	err = errors.New("anonymous access")
+	if c.Credentials != nil {
+		creds, err = c.Credentials.Retrieve(ctx)
+	}
 	if err != nil {
 		fs.Debugf(f, "KamPlexFS: sending unsigned request as no credentials: %v", err)
 	} else {

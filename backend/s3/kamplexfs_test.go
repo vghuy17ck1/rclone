@@ -541,6 +541,23 @@ func TestKamPlexFSCapabilities(t *testing.T) {
 	})
 }
 
+func TestKamPlexFSAnonymous(t *testing.T) {
+	ctx := context.Background()
+	k := newKamPlexFSFake(t, false)
+	regInfo, err := fs.Find("s3")
+	require.NoError(t, err)
+	m := fs.ConfigMap("s3", regInfo.Options, "TestKamPlexFS", configmap.Simple{
+		"provider": kamplexfsProvider,
+		"endpoint": k.endpoint(),
+	})
+	f, err := NewFs(ctx, "TestKamPlexFS", "bucket", m)
+	require.NoError(t, err)
+	assert.True(t, f.(*Fs).kpx.has(kamplexfsFeatureRenameObject))
+	caps := k.find("kamplexfsCapabilities")
+	require.Len(t, caps, 1)
+	assert.Empty(t, caps[0].Header.Get("Authorization"))
+}
+
 func TestKamPlexFSChecksumsOverHTTPS(t *testing.T) {
 	ctx, ci := fs.AddConfig(context.Background())
 	ci.InsecureSkipVerify = true
