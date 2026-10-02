@@ -140,6 +140,7 @@ type kamplexfs struct {
 	hashes       hash.Set
 	blake3       *kamplexfsBlake3Cache // nil unless the server has BLAKE3
 	hashSem      *semaphore.Weighted   // limits the BLAKE3 hashing of uploads
+	headUploads  bool                  // HEAD multipart uploads for their BLAKE3
 }
 
 // has returns true if the server advertised the feature
@@ -250,9 +251,11 @@ func (f *Fs) kamplexfsSetup(ctx context.Context, m configmap.Mapper) error {
 	}
 
 	// The server verifies Content-MD5 and returns the MD5 as the
-	// ETag, so the HEAD after each upload adds nothing.
+	// ETag, so the HEAD after each upload adds nothing, except to
+	// read the BLAKE3 of multipart uploads.
 	if !optionIsSet(m, "no_head") {
 		f.opt.NoHead = true
+		k.headUploads = true
 	}
 	if !optionIsSet(m, "list_chunk") && k.caps.MaxKeys > 0 {
 		f.opt.ListChunk = int32(min(k.caps.MaxKeys, math.MaxInt32))
@@ -642,6 +645,16 @@ func (o *Object) kamplexfsBlake3(ctx context.Context) (string, error) {
 		return "", err
 	}
 	return o.blake3, nil
+}
+
+// kamplexfsHeadUpload returns true if the upload hashed by h must be
+// HEADed to read its BLAKE3 even with no_head.
+//
+// CompleteMultipartUpload responses can't carry the BLAKE3 header as
+// the server keeps the connection alive by sending the body before it
+// has finished, and can only send a fixed set of headers after it.
+func (f *Fs) kamplexfsHeadUpload(h *kamplexfsUploadHash, multipart bool) bool {
+	return h != nil && multipart && f.kpx.headUploads
 }
 
 // kamplexfsUploadHash hashes the data of an upload with BLAKE3

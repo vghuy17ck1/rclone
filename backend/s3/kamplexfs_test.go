@@ -202,9 +202,7 @@ func (k *kamplexfsFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Length", strconv.FormatInt(o.size, 10))
 		w.Header().Set("ETag", `"`+o.etag+`"`)
-		if o.blake3 != "" {
-			w.Header().Set(kamplexfsBlake3Header, o.blake3)
-		}
+		k.blake3Header(w, o)
 		w.Header().Set("Last-Modified", o.lastModified.UTC().Format(http.TimeFormat))
 		w.WriteHeader(http.StatusOK)
 	default:
@@ -277,8 +275,8 @@ func (k *kamplexfsFake) setData(o *kamplexfsObject, data []byte) {
 	}
 }
 
-// uploadHeaders sets the headers of an upload response for o
-func (k *kamplexfsFake) uploadHeaders(w http.ResponseWriter, o *kamplexfsObject) {
+// blake3Header sets the BLAKE3 header of a response for o
+func (k *kamplexfsFake) blake3Header(w http.ResponseWriter, o *kamplexfsObject) {
 	switch {
 	case o.blake3 == "":
 	case k.blake3Wrong:
@@ -296,7 +294,7 @@ func (k *kamplexfsFake) store(w http.ResponseWriter, name string, o *kamplexfsOb
 			o.etag, o.lastModified.UTC().Format(time.RFC3339))
 		return
 	}
-	k.uploadHeaders(w, o)
+	k.blake3Header(w, o)
 	w.Header().Set("ETag", `"`+o.etag+`"`)
 	w.WriteHeader(http.StatusOK)
 }
@@ -351,7 +349,9 @@ func (k *kamplexfsFake) completeUpload(w http.ResponseWriter, name string) {
 	o := &kamplexfsObject{meta: upload.meta}
 	k.setData(o, data)
 	o.etag += fmt.Sprintf("-%d", len(upload.parts))
-	k.uploadHeaders(w, o)
+	// Like the server, it doesn't send the BLAKE3 header here as
+	// the server can only send a fixed set of headers after its
+	// keep-alive body.
 	bucket, key, _ := strings.Cut(name, "/")
 	k.storeObject(o, name)
 	_, _ = fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><CompleteMultipartUploadResult><Bucket>%s</Bucket><Key>%s</Key><ETag>"%s"</ETag></CompleteMultipartUploadResult>`,
