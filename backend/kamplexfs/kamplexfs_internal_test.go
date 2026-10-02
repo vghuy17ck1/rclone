@@ -271,11 +271,14 @@ func TestUploadRequest(t *testing.T) {
 	o, err := f.Put(ctx, bytes.NewBufferString("hello"), src)
 	require.NoError(t, err)
 	reqs := fake.Requests()
-	require.Len(t, reqs, 2, "must not stat after the upload")
+	require.Len(t, reqs, 3, "must not stat after the upload")
 	// the bucket is made on the first upload only
 	assert.Equal(t, "POST", reqs[0].Method)
 	assert.Equal(t, "/api/v1/buckets", reqs[0].Path)
-	reqs = reqs[1:]
+	// and the hashes of the server are read once
+	assert.Equal(t, "GET", reqs[1].Method)
+	assert.Equal(t, "/api/v1/buckets", reqs[1].Path)
+	reqs = reqs[2:]
 	assert.Equal(t, "PUT", reqs[0].Method)
 	assert.Equal(t, "/content/bucket/dir/a b+.txt", reqs[0].Path)
 	assert.Contains(t, reqs[0].Query, "md5=5d41402abc4b2a76b9719d911017c592")

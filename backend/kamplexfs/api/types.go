@@ -31,6 +31,9 @@ type File struct {
 	CreatedAt    int64             `json:"createdAt"`
 	UpdatedAt    int64             `json:"updatedAt"`
 	CustomTags   map[string]string `json:"customTags,omitempty"`
+	// Blake3Checksum is set on servers with BLAKE3 enabled, nil
+	// until the server has computed it
+	Blake3Checksum *string `json:"blake3Checksum,omitempty"`
 }
 
 // Folder is a FolderResource
@@ -60,6 +63,9 @@ type List struct {
 type BucketList struct {
 	Kind    string   `json:"kind"`
 	Buckets []string `json:"buckets"`
+	// Hashes are the hashes the server has, "md5" and "blake3", or
+	// nil on servers which only have MD5
+	Hashes []string `json:"hashes"`
 }
 
 // Bucket is a BucketResource
@@ -140,6 +146,17 @@ var matchMD5 = regexp.MustCompile(`^[0-9a-f]{32}$`)
 func (f *File) MD5() string {
 	if matchMD5.MatchString(f.MD5Checksum) {
 		return f.MD5Checksum
+	}
+	return ""
+}
+
+var matchBlake3 = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+// Blake3 returns the BLAKE3 of the file or "" if the server hasn't
+// hashed it yet.
+func (f *File) Blake3() string {
+	if f.Blake3Checksum != nil && matchBlake3.MatchString(*f.Blake3Checksum) {
+		return *f.Blake3Checksum
 	}
 	return ""
 }

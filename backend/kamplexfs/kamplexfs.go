@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -20,6 +21,7 @@ import (
 	"github.com/ncw/swift/v2"
 	"github.com/rclone/rclone/backend/kamplexfs/api"
 	"github.com/rclone/rclone/fs"
+	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/config"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
@@ -33,6 +35,7 @@ import (
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/pacer"
 	"github.com/rclone/rclone/lib/rest"
+	"golang.org/x/sync/semaphore"
 )
 
 const (
@@ -105,6 +108,18 @@ the tokens. Leave blank for no restriction.`,
 			Default:  1000,
 			Advanced: true,
 		}, {
+			Name: "blake3_concurrency",
+			Help: `Maximum number of BLAKE3 hashes computed at once.
+
+When the server computes BLAKE3 digests, rclone hashes the data of
+each upload as it sends it and fails the upload if the digest the
+server returns is different. This limits how many uploads are hashed
+at the same moment, and so the CPU used for it.
+
+0 means the number of CPUs.`,
+			Default:  0,
+			Advanced: true,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -119,15 +134,16 @@ the tokens. Leave blank for no restriction.`,
 
 // Options defines the configuration for this backend
 type Options struct {
-	URL             string               `config:"url"`
-	JWTSecret       string               `config:"jwt_secret"`
-	Token           string               `config:"token"`
-	JWTTTL          fs.Duration          `config:"jwt_ttl"`
-	AllowedPrefixes fs.CommaSepList      `config:"allowed_prefixes"`
-	AllowedMethods  fs.CommaSepList      `config:"allowed_methods"`
-	Route           string               `config:"route"`
-	ListChunk       int                  `config:"list_chunk"`
-	Enc             encoder.MultiEncoder `config:"encoding"`
+	URL               string               `config:"url"`
+	JWTSecret         string               `config:"jwt_secret"`
+	Token             string               `config:"token"`
+	JWTTTL            fs.Duration          `config:"jwt_ttl"`
+	AllowedPrefixes   fs.CommaSepList      `config:"allowed_prefixes"`
+	AllowedMethods    fs.CommaSepList      `config:"allowed_methods"`
+	Route             string               `config:"route"`
+	ListChunk         int                  `config:"list_chunk"`
+	Blake3Concurrency int                  `config:"blake3_concurrency"`
+	Enc               encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents a remote KamPlexFS server
@@ -145,6 +161,10 @@ type Fs struct {
 	cache         *bucket.Cache // cache for bucket creation status
 	server        *serverState  // what has been learnt about the server
 	noFoldersOnce sync.Once
+
+	ctx        context.Context     // for the request in Hashes
+	hashesOnce sync.Once           // Hashes has asked the server
+	hashSem    *semaphore.Weighted // limits the BLAKE3 hashing of uploads
 }
 
 // serverState is what has been learnt about a server from its
@@ -157,6 +177,9 @@ type serverState struct {
 	bucketAPI    atomic.Int32 // whether the server has bucket endpoints
 	// whether recursive listings have every folder in the first page
 	recursiveFolders atomic.Int32
+	hashesMu         sync.Mutex
+	hashes           hash.Set // hashes the server has
+	hashesKnown      bool     // set if hashes has been read
 }
 
 // Values of the serverState fields which are unknown until the
@@ -178,6 +201,7 @@ type Object struct {
 	size     int64     // size of the object
 	modTime  time.Time // modification time of the object
 	md5      string    // MD5 of the object or "" if unknown
+	blake3   string    // BLAKE3 of the object or "" if unknown
 	mimeType string    // MIME type of the object
 }
 
@@ -451,6 +475,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	f := &Fs{
 		name:   name,
 		opt:    *opt,
+		ctx:    ctx,
 		tokens: ts,
 		server: server.(*serverState),
 		// The bucket endpoints are mounted next to the file ones,
@@ -467,6 +492,11 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		BucketBased:             true,
 		BucketBasedRootOK:       true,
 	}).Fill(ctx, f)
+	workers := opt.Blake3Concurrency
+	if workers <= 0 {
+		workers = runtime.NumCPU()
+	}
+	f.hashSem = semaphore.NewWeighted(int64(workers))
 
 	// Check to see if the root is actually an existing file
 	if f.rootBucket != "" && f.rootDirectory != "" && !strings.HasSuffix(root, "/") {
@@ -705,6 +735,7 @@ func (f *Fs) listBuckets(ctx context.Context) (entries fs.DirEntries, err error)
 			return nil, fmt.Errorf("failed to list buckets: %w", err)
 		}
 	}
+	f.setHashes(result.Hashes)
 	for _, name := range result.Buckets {
 		entries = append(entries, fs.NewDir(f.opt.Enc.ToStandardName(name), time.Time{}))
 	}
@@ -1206,9 +1237,62 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	return err
 }
 
+// setHashes records the hashes of the server from a bucket listing
+//
+// Servers which don't say only have MD5.
+func (f *Fs) setHashes(names []string) {
+	hashes := hash.Set(hash.MD5)
+	if names != nil {
+		hashes = hash.Set(hash.None)
+		for _, name := range names {
+			var t hash.Type
+			if t.Set(name) == nil && (t == hash.MD5 || t == hash.BLAKE3) {
+				hashes.Add(t)
+			}
+		}
+	}
+	f.server.hashesMu.Lock()
+	defer f.server.hashesMu.Unlock()
+	if f.server.hashes != hashes {
+		fs.Debugf(f, "Server has hashes %v", hashes)
+	}
+	f.server.hashes = hashes
+	f.server.hashesKnown = true
+}
+
 // Hashes returns the supported hash sets.
+//
+// The server says which hashes it has when it lists the buckets, so
+// the first call lists them if that hasn't been done yet.
 func (f *Fs) Hashes() hash.Set {
-	return hash.Set(hash.MD5)
+	f.hashesOnce.Do(func() {
+		f.server.hashesMu.Lock()
+		known := f.server.hashesKnown
+		f.server.hashesMu.Unlock()
+		if known {
+			return
+		}
+		_, err := f.listBuckets(f.ctx)
+		if err != nil {
+			fs.Debugf(f, "Failed to find the hashes of the server, assuming MD5: %v", err)
+		}
+	})
+	f.server.hashesMu.Lock()
+	defer f.server.hashesMu.Unlock()
+	if !f.server.hashesKnown {
+		return hash.Set(hash.MD5)
+	}
+	return f.server.hashes
+}
+
+// FingerprintHashes returns the hashes which may be used in a
+// fingerprint.
+//
+// The BLAKE3 of an object can appear after it was uploaded, for
+// example when the server computes it in the background, which would
+// make the fingerprint change.
+func (f *Fs) FingerprintHashes() hash.Set {
+	return f.Hashes() &^ hash.Set(hash.BLAKE3)
 }
 
 // ------------------------------------------------------------
@@ -1231,8 +1315,12 @@ func (o *Object) Remote() string {
 	return o.remote
 }
 
-// Hash returns the MD5 of an object returning a lowercase hex string
+// Hash returns the MD5 or BLAKE3 of an object returning a lowercase
+// hex string
 func (o *Object) Hash(ctx context.Context, t hash.Type) (string, error) {
+	if t == hash.BLAKE3 && o.fs.Hashes().Contains(hash.BLAKE3) {
+		return o.blake3, nil
+	}
 	if t != hash.MD5 {
 		return "", hash.ErrUnsupported
 	}
@@ -1261,6 +1349,7 @@ func (o *Object) setMetaData(info *api.File) error {
 	o.size = info.Size
 	o.modTime = modTime
 	o.md5 = info.MD5()
+	o.blake3 = info.Blake3()
 	o.mimeType = info.MimeType
 	return nil
 }
@@ -1338,6 +1427,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if err != nil {
 		return err
 	}
+	in, uploadHash := o.fs.hashUpload(ctx, in)
 	params := url.Values{"mtime": {o.fs.formatMtime(src.ModTime(ctx))}}
 	if md5, err := src.Hash(ctx, hash.MD5); err == nil && md5 != "" {
 		params.Set("md5", md5)
@@ -1361,7 +1451,64 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	if err != nil {
 		return fmt.Errorf("failed to upload: %w", err)
 	}
-	return o.setMetaData(&info)
+	err = o.setMetaData(&info)
+	if err != nil {
+		return err
+	}
+	return o.checkUpload(uploadHash)
+}
+
+// uploadHash hashes the data of an upload with BLAKE3
+type uploadHash struct {
+	ctx context.Context
+	in  io.Reader
+	sem *semaphore.Weighted
+	mh  *hash.MultiHasher
+}
+
+// Read reads from the upload, hashing what was read
+func (h *uploadHash) Read(p []byte) (n int, err error) {
+	n, err = h.in.Read(p)
+	if n > 0 {
+		if semErr := h.sem.Acquire(h.ctx, 1); semErr != nil {
+			return n, semErr
+		}
+		_, _ = h.mh.Write(p[:n])
+		h.sem.Release(1)
+	}
+	return n, err
+}
+
+// hashUpload returns in wrapped to hash what is uploaded from it, or
+// in and nil if the server has no BLAKE3 to check it against.
+func (f *Fs) hashUpload(ctx context.Context, in io.Reader) (io.Reader, *uploadHash) {
+	if !f.Hashes().Contains(hash.BLAKE3) {
+		return in, nil
+	}
+	mh, err := hash.NewMultiHasherTypes(hash.NewHashSet(hash.BLAKE3))
+	if err != nil {
+		fs.Debugf(f, "Not checking uploads: %v", err)
+		return in, nil
+	}
+	// Hash inside the accounting so it still sees the reads
+	in, wrap := accounting.UnWrap(in)
+	h := &uploadHash{ctx: ctx, in: in, sem: f.hashSem, mh: mh}
+	return wrap(h), h
+}
+
+// checkUpload returns an error if the BLAKE3 of the data uploaded
+// differs from the one the server returned.
+func (o *Object) checkUpload(h *uploadHash) error {
+	// The server only returns it if it hashed the data inline
+	if h == nil || o.blake3 == "" {
+		return nil
+	}
+	sent := h.mh.Sums()[hash.BLAKE3]
+	if sent != o.blake3 {
+		return fmt.Errorf("upload corrupted: BLAKE3 differ: sent %s but server has %s", sent, o.blake3)
+	}
+	fs.Debugf(o, "BLAKE3 of upload: %s OK", sent)
+	return nil
 }
 
 // Remove an object
@@ -1389,14 +1536,15 @@ func (o *Object) ID() string {
 
 // Check the interfaces are satisfied
 var (
-	_ fs.Fs          = (*Fs)(nil)
-	_ fs.Purger      = (*Fs)(nil)
-	_ fs.PutStreamer = (*Fs)(nil)
-	_ fs.Copier      = (*Fs)(nil)
-	_ fs.Mover       = (*Fs)(nil)
-	_ fs.DirMover    = (*Fs)(nil)
-	_ fs.ListRer     = (*Fs)(nil)
-	_ fs.Object      = (*Object)(nil)
-	_ fs.MimeTyper   = (*Object)(nil)
-	_ fs.IDer        = (*Object)(nil)
+	_ fs.Fs                = (*Fs)(nil)
+	_ fs.Purger            = (*Fs)(nil)
+	_ fs.PutStreamer       = (*Fs)(nil)
+	_ fs.Copier            = (*Fs)(nil)
+	_ fs.Mover             = (*Fs)(nil)
+	_ fs.DirMover          = (*Fs)(nil)
+	_ fs.ListRer           = (*Fs)(nil)
+	_ fs.FingerprintHasher = (*Fs)(nil)
+	_ fs.Object            = (*Object)(nil)
+	_ fs.MimeTyper         = (*Object)(nil)
+	_ fs.IDer              = (*Object)(nil)
 )
