@@ -392,3 +392,52 @@ func TestKamPlexFSBlake3Header(t *testing.T) {
 		assert.Equal(t, test.want, o.blake3, test.header)
 	}
 }
+
+func TestKamPlexFSBlake3HashesOption(t *testing.T) {
+	ctx := context.Background()
+	for _, test := range []struct {
+		name   string
+		caps   string
+		option string
+		want   hash.Set
+	}{
+		{"BLAKE3Off", kamplexfsHashFeatures(true), "md5", hash.Set(hash.MD5)},
+		{"BLAKE3Only", kamplexfsHashFeatures(true), "blake3", hash.Set(hash.BLAKE3)},
+		{"Both", kamplexfsAllFeatures, "md5, blake3", hash.NewHashSet(hash.MD5, hash.BLAKE3)},
+		{"None", kamplexfsHashFeatures(true), "none", hash.Set(hash.None)},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			k := newKamPlexFSFake(t, false)
+			k.capsBody = test.caps
+			k.blake3 = true
+			k.blake3Wrong = true
+			f := newKamPlexFSTestFs(ctx, t, k.endpoint(), kamplexfsProvider, configmap.Simple{"hashes": test.option})
+			assert.Equal(t, test.want, f.Hashes())
+
+			o, err := putData(ctx, f, "file.txt", []byte("hello"))
+			if test.want.Contains(hash.BLAKE3) {
+				// The upload is checked
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), "BLAKE3 differ")
+				return
+			}
+			require.NoError(t, err)
+			_, err = o.Hash(ctx, hash.BLAKE3)
+			assert.ErrorIs(t, err, hash.ErrUnsupported)
+		})
+	}
+
+	t.Run("Invalid", func(t *testing.T) {
+		k := newKamPlexFSFake(t, false)
+		regInfo, err := fs.Find("s3")
+		require.NoError(t, err)
+		m := fs.ConfigMap("s3", regInfo.Options, "TestKamPlexFS", configmap.Simple{
+			"provider": kamplexfsProvider,
+			"endpoint": k.endpoint(),
+			"hashes":   "md5,sha1",
+		})
+		_, err = NewFs(ctx, "TestKamPlexFS", "bucket", m)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `"sha1" isn't md5, blake3 or none`)
+	})
+}
