@@ -138,8 +138,19 @@ Servers which can set the modification time of an existing file do so
 in place. Older servers can't, so rclone uploads the file again when
 only its modification time has changed.
 
-MD5 hashes are supported. A file which the server hasn't hashed yet
-has no hash.
+MD5 hashes are supported, and BLAKE3 hashes too on servers which
+compute them. rclone finds out which hashes the server has from its
+bucket listing the first time it needs to know. A file which the
+server hasn't hashed yet has no hash.
+
+When the server computes BLAKE3 hashes, rclone hashes each upload as
+it sends it and fails the upload if the server's hash is different.
+`--kamplexfs-blake3-concurrency` limits how many uploads are hashed at
+once.
+
+BLAKE3 hashes are never used to tell whether a file has changed, for
+example by the VFS cache of `rclone mount`, as a file may only get one
+some time after it was uploaded.
 
 ### Empty directories
 
@@ -288,6 +299,24 @@ Properties:
 - Env Var:     RCLONE_KAMPLEXFS_LIST_CHUNK
 - Type:        int
 - Default:     1000
+
+#### --kamplexfs-blake3-concurrency
+
+Maximum number of BLAKE3 hashes computed at once.
+
+When the server computes BLAKE3 digests, rclone hashes the data of
+each upload as it sends it and fails the upload if the digest the
+server returns is different. This limits how many uploads are hashed
+at the same moment, and so the CPU used for it.
+
+0 means the number of CPUs.
+
+Properties:
+
+- Config:      blake3_concurrency
+- Env Var:     RCLONE_KAMPLEXFS_BLAKE3_CONCURRENCY
+- Type:        int
+- Default:     0
 
 #### --kamplexfs-encoding
 
