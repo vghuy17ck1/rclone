@@ -148,6 +148,12 @@ it sends it and fails the upload if the server's hash is different.
 `--kamplexfs-blake3-concurrency` limits how many uploads are hashed at
 once.
 
+Set `hashes` in the config, or `--kamplexfs-hashes`, to choose the
+hashes instead, for example `hashes = md5` to turn BLAKE3 off, or
+`hashes = blake3` to compare files by BLAKE3 only. This also saves
+the bucket listing, which tokens restricted with `allowed_prefixes`
+can't make, so they need it to use BLAKE3.
+
 BLAKE3 hashes are never used to tell whether a file has changed, for
 example by the VFS cache of `rclone mount`, as a file may only get one
 some time after it was uploaded.
@@ -317,6 +323,26 @@ Properties:
 - Env Var:     RCLONE_KAMPLEXFS_BLAKE3_CONCURRENCY
 - Type:        int
 - Default:     0
+
+#### --kamplexfs-hashes
+
+Hashes to use instead of the ones the server lists.
+
+A comma separated list of md5 and blake3, or none for no hashes.
+Leave blank to use the hashes the server lists with its buckets.
+
+For example md5 turns BLAKE3 off, saving the hashing of uploads, and
+blake3 makes rclone compare files by BLAKE3 only. Setting it also
+saves the request which finds out the server's hashes, which tokens
+restricted with allowed_prefixes can't make. Only list hashes the
+server computes, as files have no hash otherwise.
+
+Properties:
+
+- Config:      hashes
+- Env Var:     RCLONE_KAMPLEXFS_HASHES
+- Type:        CommaSepList
+- Default:     
 
 #### --kamplexfs-encoding
 

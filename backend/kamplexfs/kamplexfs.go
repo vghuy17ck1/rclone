@@ -120,6 +120,20 @@ at the same moment, and so the CPU used for it.
 			Default:  0,
 			Advanced: true,
 		}, {
+			Name: "hashes",
+			Help: `Hashes to use instead of the ones the server lists.
+
+A comma separated list of md5 and blake3, or none for no hashes.
+Leave blank to use the hashes the server lists with its buckets.
+
+For example md5 turns BLAKE3 off, saving the hashing of uploads, and
+blake3 makes rclone compare files by BLAKE3 only. Setting it also
+saves the request which finds out the server's hashes, which tokens
+restricted with allowed_prefixes can't make. Only list hashes the
+server computes, as files have no hash otherwise.`,
+			Default:  fs.CommaSepList{},
+			Advanced: true,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -143,6 +157,7 @@ type Options struct {
 	Route             string               `config:"route"`
 	ListChunk         int                  `config:"list_chunk"`
 	Blake3Concurrency int                  `config:"blake3_concurrency"`
+	Hashes            fs.CommaSepList      `config:"hashes"`
 	Enc               encoder.MultiEncoder `config:"encoding"`
 }
 
@@ -165,6 +180,7 @@ type Fs struct {
 	ctx        context.Context     // for the request in Hashes
 	hashesOnce sync.Once           // Hashes has asked the server
 	hashSem    *semaphore.Weighted // limits the BLAKE3 hashing of uploads
+	hashes     hash.Set            // hashes from the options, 0 if not set
 }
 
 // serverState is what has been learnt about a server from its
@@ -497,6 +513,12 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		workers = runtime.NumCPU()
 	}
 	f.hashSem = semaphore.NewWeighted(int64(workers))
+	if len(opt.Hashes) > 0 {
+		f.hashes, err = parseHashes(opt.Hashes)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	// Check to see if the root is actually an existing file
 	if f.rootBucket != "" && f.rootDirectory != "" && !strings.HasSuffix(root, "/") {
@@ -1237,6 +1259,20 @@ func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string
 	return err
 }
 
+// parseHashes parses the hashes option
+func parseHashes(names []string) (hash.Set, error) {
+	hashes := hash.Set(hash.None)
+	for _, name := range names {
+		var t hash.Type
+		err := t.Set(strings.TrimSpace(name))
+		if err != nil || (t != hash.None && t != hash.MD5 && t != hash.BLAKE3) {
+			return hashes, fmt.Errorf("kamplexfs: hashes: %q isn't md5, blake3 or none", name)
+		}
+		hashes.Add(t)
+	}
+	return hashes, nil
+}
+
 // setHashes records the hashes of the server from a bucket listing
 //
 // Servers which don't say only have MD5.
@@ -1265,6 +1301,9 @@ func (f *Fs) setHashes(names []string) {
 // The server says which hashes it has when it lists the buckets, so
 // the first call lists them if that hasn't been done yet.
 func (f *Fs) Hashes() hash.Set {
+	if len(f.opt.Hashes) > 0 {
+		return f.hashes
+	}
 	f.hashesOnce.Do(func() {
 		f.server.hashesMu.Lock()
 		known := f.server.hashesKnown
