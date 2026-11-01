@@ -126,8 +126,7 @@ the server computes, as files have no hash otherwise.`,
 One signed request opens an upload session and the bytes go over TUS,
 so a dropped connection resumes from what the server already has.
 
-They are only used if the server supports them. Conditional, encrypted
-and object locked uploads are made as multipart uploads.
+They are only used if the server supports them.
 
 Each upload holds a chunk of chunk_size in memory until the server has
 it, as the source can't be rewound to send it again, so up to
@@ -1039,25 +1038,6 @@ func (f *Fs) kamplexfsResumable(size int64) bool {
 	return size < 0 || f.kpx.opt.Resumable == kamplexfsResumableAlways || f.opt.UploadConcurrency == 1
 }
 
-// kamplexfsResumableUnsupported returns why req can't be made as a
-// resumable upload, or "" if it can.
-//
-// The server only stores the content type, the modification time and
-// the tags of any upload, which opening the session sends, but the
-// session can't apply the conditions, encryption or object lock of a
-// PutObject.
-func kamplexfsResumableUnsupported(req *s3.PutObjectInput) string {
-	switch {
-	case req.IfMatch != nil || req.IfNoneMatch != nil:
-		return "it is conditional"
-	case req.ServerSideEncryption != "" || req.SSECustomerAlgorithm != nil || req.SSEKMSKeyId != nil:
-		return "it is encrypted"
-	case req.ObjectLockMode != "" || req.ObjectLockRetainUntilDate != nil || req.ObjectLockLegalHoldStatus != "":
-		return "it has an object lock"
-	}
-	return ""
-}
-
 // kamplexfsRedact returns the session URL without its query, which
 // holds the token authorising the session.
 func kamplexfsRedact(location string) string {
@@ -1071,17 +1051,13 @@ func kamplexfsRedact(location string) string {
 // the size uploaded and the ETag the server returned.
 //
 // It returns errKamplexfsNoResumable before reading from in if the
-// upload can't be made this way.
+// server has resumable uploads turned off.
 //
 // uploadHash, which may be nil, is hashing in.
 func (o *Object) kamplexfsUploadResumable(ctx context.Context, src fs.ObjectInfo, in io.Reader, uploadHash *kamplexfsUploadHash, size int64, options ...fs.OpenOption) (ui uploadInfo, n int64, etag string, err error) {
 	ui, err = o.prepareUpload(ctx, src, options, true)
 	if err != nil {
 		return ui, size, "", fmt.Errorf("failed to prepare upload: %w", err)
-	}
-	if reason := kamplexfsResumableUnsupported(ui.req); reason != "" {
-		fs.Debugf(o, "KamPlexFS: not using a resumable upload as %s", reason)
-		return ui, size, "", errKamplexfsNoResumable
 	}
 	location, err := o.kamplexfsOpenSession(ctx, ui.req, size)
 	if err != nil {
@@ -1137,6 +1113,8 @@ func (o *Object) kamplexfsOpenSession(ctx context.Context, req *s3.PutObjectInpu
 	if err != nil {
 		return "", err
 	}
+	// The server stores nothing else of any upload, and ignores the
+	// conditions, encryption and object lock of a PutObject too
 	headers := map[string]string{
 		"Content-Type":     deref(req.ContentType),
 		"X-Amz-Meta-Mtime": req.Metadata[metaMtime],
