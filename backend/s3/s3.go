@@ -5145,9 +5145,14 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	var versionID *string      // versionID we got from the upload
 	var err error
 	var ui uploadInfo
-	if multipart {
+	var resumable bool // uploaded with a KamPlexFS resumable upload
+	if multipart && o.fs.kamplexfsResumable(size) {
+		ui, size, gotETag, err = o.kamplexfsUploadResumable(ctx, src, in, size, options...)
+		resumable = !errors.Is(err, errKamplexfsNoResumable)
+	}
+	if multipart && !resumable {
 		wantETag, gotETag, versionID, ui, err = o.uploadMultipart(ctx, src, in, options...)
-	} else {
+	} else if !multipart {
 		ui, err = o.prepareUpload(ctx, src, options, false)
 		if err != nil {
 			return fmt.Errorf("failed to prepare upload: %w", err)
@@ -5173,7 +5178,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	// so make up the object as best we can assuming it got
 	// uploaded properly. If size < 0 then we need to do the HEAD.
 	var head *s3.HeadObjectOutput
-	if o.fs.opt.NoHead && size >= 0 && !o.fs.kamplexfsHeadUpload(uploadHash, multipart) {
+	if o.fs.opt.NoHead && size >= 0 && !o.fs.kamplexfsHeadUpload(uploadHash, multipart && o.blake3 == "") {
 		head = new(s3.HeadObjectOutput)
 		//structs.SetFrom(head, &req)
 		setFrom_s3HeadObjectOutput_s3PutObjectInput(head, ui.req)

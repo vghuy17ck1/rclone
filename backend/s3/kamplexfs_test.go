@@ -57,6 +57,7 @@ type kamplexfsFake struct {
 	requests []kamplexfsRequest
 	objects  map[string]*kamplexfsObject // keyed by bucket/key
 	uploads  map[string]*kamplexfsUpload // multipart uploads keyed by bucket/key
+	tus      kamplexfsTusFake            // resumable uploads
 
 	// hashing, as set by enable_md5 and enable_blake3
 	noMD5         bool // ETags aren't MD5s
@@ -140,6 +141,10 @@ func (k *kamplexfsFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Header: r.Header.Clone(),
 	})
 	k.mu.Unlock()
+	if strings.HasPrefix(r.URL.Path, "/.tus/") {
+		k.tusServe(w, r)
+		return
+	}
 	if !strings.HasPrefix(r.URL.Path, "/s3/") {
 		writeS3Error(w, http.StatusNotFound, "NoSuchBucket")
 		return
@@ -154,6 +159,8 @@ func (k *kamplexfsFake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(k.capsBody))
+	case r.Method == http.MethodPost && q.Has("kamplexfsResumable"):
+		k.tusOpen(w, r, bucket+"/"+key)
 	case q.Has("renameObject"):
 		if k.renameStatus != http.StatusOK {
 			writeS3Error(w, k.renameStatus, k.renameCode)
