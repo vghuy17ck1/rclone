@@ -169,7 +169,9 @@ jobs:
         run: |
           make release_dep_linux
           sudo apt-get update
-          sudo apt-get install -y qemu-user-static
+          # qemu-user-static is only a virtual package from Ubuntu
+          # 26.04, which apt won't install by that name
+          sudo apt-get install -y qemu-user-binfmt
         if: matrix.job_name == 'linux'
 
       - name: Install Libraries on macOS
