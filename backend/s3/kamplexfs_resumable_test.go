@@ -867,9 +867,9 @@ func TestKamPlexFSResumableWhen(t *testing.T) {
 			options: []fs.OpenOption{fs.MetadataOption{"color": "blue"}}},
 		{name: "ACL", extra: withConcurrency("always", "1", "acl", "private"), data: big, resumable: true},
 		{name: "StorageClass", extra: withConcurrency("always", "1", "storage_class", "STANDARD"), data: big, resumable: true},
-		{name: "Conditional", extra: withConcurrency("always", "1"), data: big,
+		{name: "Conditional", extra: withConcurrency("always", "1"), data: big, resumable: true,
 			options: []fs.OpenOption{&fs.HTTPOption{Key: "If-None-Match", Value: "*"}}},
-		{name: "Encrypted", extra: withConcurrency("always", "1", "server_side_encryption", "AES256"), data: big},
+		{name: "Encrypted", extra: withConcurrency("always", "1", "server_side_encryption", "AES256"), data: big, resumable: true},
 		{name: "Tagging", extra: withConcurrency("always", "1"), data: big, resumable: true, tagging: "a=b",
 			options: []fs.OpenOption{&fs.HTTPOption{Key: "X-Amz-Tagging", Value: "a=b"}}},
 	} {
