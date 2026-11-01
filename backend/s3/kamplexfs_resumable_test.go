@@ -310,6 +310,10 @@ func checkStored(t *testing.T, k *kamplexfsFake, data []byte) {
 	k.mu.Unlock()
 	require.NotNil(t, o, "object not stored")
 	assert.Equal(t, int64(len(data)), o.size)
+	if k.noMD5 {
+		assert.Equal(t, "b3-"+blake3Hex(data), o.etag)
+		return
+	}
 	// Multipart ETags of the fake are the MD5 with the part count
 	etag, _, _ := strings.Cut(o.etag, "-")
 	assert.Equal(t, md5Hex(data), etag)
@@ -545,19 +549,46 @@ func TestKamPlexFSResumableUnknownResume(t *testing.T) {
 
 func TestKamPlexFSResumableLostAnswer(t *testing.T) {
 	ctx := context.Background()
-	for _, unknown := range []bool{false, true} {
-		t.Run(fmt.Sprintf("Unknown=%v", unknown), func(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		unknown bool
+		blake3  bool // the server has BLAKE3 but not MD5
+		pending bool // the server hasn't computed the BLAKE3 yet
+		extra   configmap.Simple
+	}{
+		{name: "Known"},
+		{name: "Unknown", unknown: true},
+		{name: "BLAKE3", blake3: true},
+		{name: "BLAKE3Pending", blake3: true, pending: true},
+		{name: "BLAKE3DisableChecksum", blake3: true,
+			extra: configmap.Simple{"upload_cutoff": "5M", "chunk_size": "5M", "disable_checksum": "true"}},
+	} {
+		unknown := test.unknown
+		t.Run(test.name, func(t *testing.T) {
 			k := newKamPlexFSResumableFake(t)
+			if test.blake3 {
+				k.capsBody = strings.Replace(kamplexfsResumableFeatures, `,"md5"`, `,"blake3"`, 1)
+				k.noMD5, k.blake3, k.blake3Pending = true, true, test.pending
+			}
 			k.tus.loseLast = true
-			f := newKamPlexFSTestFs(ctx, t, k.endpoint(), kamplexfsProvider, resumableCutoff)
+			extra := resumableCutoff
+			if test.extra != nil {
+				extra = test.extra
+			}
+			f := newKamPlexFSTestFs(ctx, t, k.endpoint(), kamplexfsProvider, extra)
 			data := resumableData(6 * 1024 * 1024)
 			o, err := putResumable(ctx, f, data, unknown)
 			require.NoError(t, err)
 			checkStored(t, k, data)
 			assert.Equal(t, int64(len(data)), o.Size())
-			// HEADs of the session, which has gone, and the object
+			// HEADs of the session, which has gone, and the object,
+			// which is HEADed again for a BLAKE3 not computed yet
+			heads := 2
+			if test.pending {
+				heads = 3
+			}
 			assert.Len(t, k.tusRequests(http.MethodHead), 1)
-			assert.Equal(t, 2, k.count(http.MethodHead))
+			assert.Equal(t, heads, k.count(http.MethodHead))
 		})
 	}
 }
@@ -579,19 +610,25 @@ func TestKamPlexFSResumableExpired(t *testing.T) {
 func TestKamPlexFSResumableLostAnswerNotStored(t *testing.T) {
 	ctx := context.Background()
 	for _, test := range []struct {
-		name  string
-		old   []byte // object stored before
-		noMD5 bool
+		name   string
+		old    []byte // object stored before
+		noMD5  bool
+		blake3 bool // the server has BLAKE3 but not MD5
 	}{
 		{name: "NoObject"},
 		{name: "OtherSize", old: []byte("old")},
 		{name: "OtherSizeNoMD5", old: []byte("old"), noMD5: true},
 		{name: "OtherData", old: resumableData(6*1024*1024 + 1)[1:]},
+		{name: "OtherDataBLAKE3", old: resumableData(6*1024*1024 + 1)[1:], blake3: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			k := newKamPlexFSResumableFake(t)
-			if test.noMD5 {
+			switch {
+			case test.noMD5:
 				k.capsBody = strings.Replace(kamplexfsResumableFeatures, `,"md5"`, ``, 1)
+			case test.blake3:
+				k.capsBody = strings.Replace(kamplexfsResumableFeatures, `,"md5"`, `,"blake3"`, 1)
+				k.noMD5, k.blake3 = true, true
 			}
 			f := newKamPlexFSTestFs(ctx, t, k.endpoint(), kamplexfsProvider, resumableCutoff)
 			if test.old != nil {
@@ -793,10 +830,13 @@ func TestKamPlexFSResumableWhen(t *testing.T) {
 	const chunk = 5 * 1024 * 1024
 	big := resumableData(chunk + 1234)
 	small := resumableData(1234)
-	withConcurrency := func(mode string, concurrency string) configmap.Simple {
+	withConcurrency := func(mode string, concurrency string, extra ...string) configmap.Simple {
 		m := configmap.Simple{"upload_cutoff": "5M", "chunk_size": "5M", "upload_concurrency": concurrency}
 		if mode != "" {
 			m["kamplexfs_resumable"] = mode
+		}
+		for i := 0; i < len(extra); i += 2 {
+			m[extra[i]] = extra[i+1]
 		}
 		return m
 	}
@@ -821,10 +861,15 @@ func TestKamPlexFSResumableWhen(t *testing.T) {
 		{name: "NeverUnknown", extra: withConcurrency("never", "1"), data: big, unknown: true},
 		{name: "OldServer", caps: kamplexfsAllFeatures, extra: withConcurrency("always", "1"), data: big},
 		{name: "OldServerUnknown", caps: kamplexfsAllFeatures, extra: withConcurrency("always", "1"), data: big, unknown: true},
-		{name: "CacheControl", extra: withConcurrency("always", "1"), data: big,
+		{name: "CacheControl", extra: withConcurrency("always", "1"), data: big, resumable: true,
 			options: []fs.OpenOption{&fs.HTTPOption{Key: "Cache-Control", Value: "no-cache"}}},
-		{name: "UserMetadata", extra: withConcurrency("always", "1"), data: big, metadata: true,
+		{name: "UserMetadata", extra: withConcurrency("always", "1"), data: big, metadata: true, resumable: true,
 			options: []fs.OpenOption{fs.MetadataOption{"color": "blue"}}},
+		{name: "ACL", extra: withConcurrency("always", "1", "acl", "private"), data: big, resumable: true},
+		{name: "StorageClass", extra: withConcurrency("always", "1", "storage_class", "STANDARD"), data: big, resumable: true},
+		{name: "Conditional", extra: withConcurrency("always", "1"), data: big,
+			options: []fs.OpenOption{&fs.HTTPOption{Key: "If-None-Match", Value: "*"}}},
+		{name: "Encrypted", extra: withConcurrency("always", "1", "server_side_encryption", "AES256"), data: big},
 		{name: "Tagging", extra: withConcurrency("always", "1"), data: big, resumable: true, tagging: "a=b",
 			options: []fs.OpenOption{&fs.HTTPOption{Key: "X-Amz-Tagging", Value: "a=b"}}},
 	} {

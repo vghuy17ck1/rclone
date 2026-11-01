@@ -126,9 +126,12 @@ the server computes, as files have no hash otherwise.`,
 One signed request opens an upload session and the bytes go over TUS,
 so a dropped connection resumes from what the server already has.
 
-They are only used if the server supports them. Uploads which set
-metadata other than the modification time, content type and tags
-are made as multipart uploads, as the session can't store it.`,
+They are only used if the server supports them. Conditional, encrypted
+and object locked uploads are made as multipart uploads.
+
+Each upload holds a chunk of chunk_size in memory until the server has
+it, as the source can't be rewound to send it again, so up to
+chunk_size * --transfers of memory is used.`,
 	Default: kamplexfsResumableAuto,
 	Examples: []fs.OptionExample{{
 		Value: kamplexfsResumableAuto.String(),
@@ -1039,21 +1042,14 @@ func (f *Fs) kamplexfsResumable(size int64) bool {
 // kamplexfsResumableUnsupported returns why req can't be made as a
 // resumable upload, or "" if it can.
 //
-// Opening the session only stores the content type, the modification
-// time and the tags.
+// The server only stores the content type, the modification time and
+// the tags of any upload, which opening the session sends, but the
+// session can't apply the conditions, encryption or object lock of a
+// PutObject.
 func kamplexfsResumableUnsupported(req *s3.PutObjectInput) string {
-	for key := range req.Metadata {
-		if key != metaMtime {
-			return fmt.Sprintf("it has %q metadata", key)
-		}
-	}
 	switch {
-	case req.CacheControl != nil || req.ContentDisposition != nil || req.ContentEncoding != nil || req.ContentLanguage != nil:
-		return "it has content headers"
 	case req.IfMatch != nil || req.IfNoneMatch != nil:
 		return "it is conditional"
-	case req.ACL != "" || req.StorageClass != "":
-		return "it has an ACL or storage class"
 	case req.ServerSideEncryption != "" || req.SSECustomerAlgorithm != nil || req.SSEKMSKeyId != nil:
 		return "it is encrypted"
 	case req.ObjectLockMode != "" || req.ObjectLockRetainUntilDate != nil || req.ObjectLockLegalHoldStatus != "":
@@ -1076,7 +1072,9 @@ func kamplexfsRedact(location string) string {
 //
 // It returns errKamplexfsNoResumable before reading from in if the
 // upload can't be made this way.
-func (o *Object) kamplexfsUploadResumable(ctx context.Context, src fs.ObjectInfo, in io.Reader, size int64, options ...fs.OpenOption) (ui uploadInfo, n int64, etag string, err error) {
+//
+// uploadHash, which may be nil, is hashing in.
+func (o *Object) kamplexfsUploadResumable(ctx context.Context, src fs.ObjectInfo, in io.Reader, uploadHash *kamplexfsUploadHash, size int64, options ...fs.OpenOption) (ui uploadInfo, n int64, etag string, err error) {
 	ui, err = o.prepareUpload(ctx, src, options, true)
 	if err != nil {
 		return ui, size, "", fmt.Errorf("failed to prepare upload: %w", err)
@@ -1098,6 +1096,7 @@ func (o *Object) kamplexfsUploadResumable(ctx context.Context, src fs.ObjectInfo
 		location: location,
 		size:     size,
 		in:       in,
+		blake3:   uploadHash,
 		buf:      make([]byte, 0, bufSize),
 	}
 	if o.fs.kpx.has(kamplexfsFeatureMD5) && !o.fs.opt.DisableChecksum {
@@ -1183,13 +1182,14 @@ type kamplexfsTus struct {
 	size     int64     // size of the upload, -1 if not known
 	in       io.Reader // the data to upload
 	md5      gohash.Hash
-	offset   int64  // bytes the server has
-	buf      []byte // the chunk held, read from in so far
-	start    int64  // offset of buf
-	eof      bool   // in is exhausted
-	inErr    error  // error reading in
-	final    bool   // a PATCH which completes the upload was sent
-	etag     string // ETag of the uploaded object
+	blake3   *kamplexfsUploadHash // nil if the upload isn't checked
+	offset   int64                // bytes the server has
+	buf      []byte               // the chunk held, read from in so far
+	start    int64                // offset of buf
+	eof      bool                 // in is exhausted
+	inErr    error                // error reading in
+	final    bool                 // a PATCH which completes the upload was sent
+	etag     string               // ETag of the uploaded object
 }
 
 // held returns the offset of the end of the data read from in
@@ -1432,20 +1432,25 @@ func (t *kamplexfsTus) patch(ctx context.Context) (done bool, err error) {
 // completed returns true if the object is stored as uploaded, for
 // when the session went away before the answer to its last PATCH
 // arrived.
+//
+// It compares the size and the MD5 and BLAKE3 the server has, so
+// with neither it can only tell the size is right.
 func (t *kamplexfsTus) completed(ctx context.Context) bool {
 	head, err := t.o.headObject(ctx)
 	if err != nil {
 		fs.Debugf(t.o, "KamPlexFS: resumable upload session gone and object not found: %v", err)
 		return false
 	}
+	t.o.kamplexfsSetBlake3(head.ResultMetadata)
 	etag := strings.Trim(strings.ToLower(deref(head.ETag)), `"`)
-	if deref(head.ContentLength) != t.length() || (t.md5 != nil && etag != hex.EncodeToString(t.md5.Sum(nil))) {
-		fs.Debugf(t.o, "KamPlexFS: resumable upload session gone and object is size %d ETag %q", deref(head.ContentLength), etag)
+	if deref(head.ContentLength) != t.length() ||
+		(t.md5 != nil && etag != hex.EncodeToString(t.md5.Sum(nil))) ||
+		(t.blake3 != nil && t.o.blake3 != "" && t.o.blake3 != t.blake3.mh.Sums()[hash.BLAKE3]) {
+		fs.Debugf(t.o, "KamPlexFS: resumable upload session gone and object is size %d ETag %q BLAKE3 %q", deref(head.ContentLength), etag, t.o.blake3)
 		return false
 	}
 	fs.Debugf(t.o, "KamPlexFS: resumable upload session gone but the object is stored")
 	t.offset, t.etag = t.length(), deref(head.ETag)
-	t.o.kamplexfsSetBlake3(head.ResultMetadata)
 	return true
 }
 
