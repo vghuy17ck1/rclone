@@ -5147,7 +5147,7 @@ func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, op
 	var ui uploadInfo
 	var resumable bool // uploaded with a KamPlexFS resumable upload
 	if multipart && o.fs.kamplexfsResumable(size) {
-		ui, size, gotETag, err = o.kamplexfsUploadResumable(ctx, src, in, size, options...)
+		ui, size, gotETag, err = o.kamplexfsUploadResumable(ctx, src, in, uploadHash, size, options...)
 		resumable = !errors.Is(err, errKamplexfsNoResumable)
 	}
 	if multipart && !resumable {
