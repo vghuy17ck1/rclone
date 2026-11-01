@@ -9,10 +9,13 @@ package s3
 
 import (
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
+	gohash "hash"
 	"io"
 	"maps"
 	"math"
@@ -23,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -37,6 +41,7 @@ import (
 	"github.com/rclone/rclone/fs/accounting"
 	"github.com/rclone/rclone/fs/config/configmap"
 	"github.com/rclone/rclone/fs/config/configstruct"
+	"github.com/rclone/rclone/fs/fserrors"
 	"github.com/rclone/rclone/fs/hash"
 	"golang.org/x/sync/semaphore"
 )
@@ -52,6 +57,7 @@ const (
 	kamplexfsFeatureChecksums           = "checksums"
 	kamplexfsFeatureBlake3              = "blake3"
 	kamplexfsFeatureMD5                 = "md5"
+	kamplexfsFeatureResumable           = "resumable-upload"
 )
 
 // kamplexfsBlake3Header carries the BLAKE3 of an object in HEAD, GET
@@ -113,14 +119,58 @@ the server computes, as files have no hash otherwise.`,
 	Default:  fs.CommaSepList{},
 	Advanced: true,
 	Provider: kamplexfsProvider,
+}, {
+	Name: "kamplexfs_resumable",
+	Help: `Use KamPlexFS resumable uploads.
+
+One signed request opens an upload session and the bytes go over TUS,
+so a dropped connection resumes from what the server already has.
+
+They are only used if the server supports them. Uploads which set
+metadata other than the modification time, content type and tags
+are made as multipart uploads, as the session can't store it.`,
+	Default: kamplexfsResumableAuto,
+	Examples: []fs.OptionExample{{
+		Value: kamplexfsResumableAuto.String(),
+		Help:  "For uploads of unknown size, and above upload_cutoff when upload_concurrency is 1.",
+	}, {
+		Value: kamplexfsResumableAlways.String(),
+		Help:  "For every upload above upload_cutoff and every unknown size.",
+	}, {
+		Value: kamplexfsResumableNever.String(),
+		Help:  "Do not use them.",
+	}},
+	Advanced: true,
+	Provider: kamplexfsProvider,
 }}
+
+// kamplexfsResumableMode says when to use resumable uploads
+type kamplexfsResumableMode = fs.Enum[kamplexfsResumableChoices]
+
+// Values of kamplexfsResumableMode
+const (
+	kamplexfsResumableAuto kamplexfsResumableMode = iota
+	kamplexfsResumableAlways
+	kamplexfsResumableNever
+)
+
+type kamplexfsResumableChoices struct{}
+
+func (kamplexfsResumableChoices) Choices() []string {
+	return []string{
+		kamplexfsResumableAuto:   "auto",
+		kamplexfsResumableAlways: "always",
+		kamplexfsResumableNever:  "never",
+	}
+}
 
 // kamplexfsOpt holds the provider specific options
 type kamplexfsOpt struct {
-	SequentialUpload  bool            `config:"kamplexfs_sequential_upload"`
-	ExactModTime      bool            `config:"kamplexfs_exact_modtime"`
-	Blake3Concurrency int             `config:"kamplexfs_blake3_concurrency"`
-	Hashes            fs.CommaSepList `config:"hashes"`
+	SequentialUpload  bool                   `config:"kamplexfs_sequential_upload"`
+	ExactModTime      bool                   `config:"kamplexfs_exact_modtime"`
+	Blake3Concurrency int                    `config:"kamplexfs_blake3_concurrency"`
+	Hashes            fs.CommaSepList        `config:"hashes"`
+	Resumable         kamplexfsResumableMode `config:"kamplexfs_resumable"`
 }
 
 // kamplexfsCapabilities is the response from the capabilities endpoint
@@ -141,6 +191,7 @@ type kamplexfs struct {
 	blake3       *kamplexfsBlake3Cache // nil unless the server has BLAKE3
 	hashSem      *semaphore.Weighted   // limits the BLAKE3 hashing of uploads
 	headUploads  bool                  // HEAD multipart uploads for their BLAKE3
+	resumable    atomic.Bool           // use resumable uploads
 }
 
 // has returns true if the server advertised the feature
@@ -293,6 +344,18 @@ func (f *Fs) kamplexfsSetup(ctx context.Context, m configmap.Mapper) error {
 			n = runtime.NumCPU()
 		}
 		k.hashSem = semaphore.NewWeighted(int64(n))
+	}
+	if k.opt.Resumable != kamplexfsResumableNever {
+		if k.has(kamplexfsFeatureResumable) {
+			k.resumable.Store(true)
+			// Multi-thread copies upload through the chunk writer,
+			// so only keep it for uploads made in parallel.
+			if !fs.GetConfig(ctx).MultiThreadSet && f.kamplexfsResumable(0) {
+				f.features.OpenChunkWriter = nil
+			}
+		} else {
+			fs.Debugf(f, "KamPlexFS: server has no resumable uploads, using multipart uploads")
+		}
 	}
 	if k.has(kamplexfsFeatureRenameObject) {
 		f.features.Move = f.kamplexfsMove
@@ -650,11 +713,13 @@ func (o *Object) kamplexfsBlake3(ctx context.Context) (string, error) {
 // kamplexfsHeadUpload returns true if the upload hashed by h must be
 // HEADed to read its BLAKE3 even with no_head.
 //
-// CompleteMultipartUpload responses can't carry the BLAKE3 header as
-// the server keeps the connection alive by sending the body before it
-// has finished, and can only send a fixed set of headers after it.
-func (f *Fs) kamplexfsHeadUpload(h *kamplexfsUploadHash, multipart bool) bool {
-	return h != nil && multipart && f.kpx.headUploads
+// noDigest is true for multipart uploads, as CompleteMultipartUpload
+// responses can't carry the BLAKE3 header: the server keeps the
+// connection alive by sending the body before it has finished, and can
+// only send a fixed set of headers after it. It is also true for
+// resumable uploads whose last response had no BLAKE3.
+func (f *Fs) kamplexfsHeadUpload(h *kamplexfsUploadHash, noDigest bool) bool {
+	return h != nil && noDigest && f.kpx.headUploads
 }
 
 // kamplexfsUploadHash hashes the data of an upload with BLAKE3
@@ -948,4 +1013,497 @@ func (f *Fs) kamplexfsListHashes(ctx context.Context, bucket, prefix, token stri
 		return nil, fmt.Errorf("failed to decode BLAKE3 listing: %w", err)
 	}
 	return &list, nil
+}
+
+// kamplexfsTusVersion is the TUS protocol version of resumable uploads
+const kamplexfsTusVersion = "1.0.0"
+
+// errKamplexfsNoResumable is returned by kamplexfsUploadResumable
+// before it has read any data if the upload must be made another way.
+var errKamplexfsNoResumable = errors.New("KamPlexFS: can't use a resumable upload")
+
+// errKamplexfsSessionGone is returned if the resumable upload
+// session is completed, deleted or expired.
+var errKamplexfsSessionGone = errors.New("KamPlexFS: resumable upload session not found")
+
+// kamplexfsResumable returns true if an upload of size bytes, or of
+// unknown size if size < 0, which is too big for a single part uses
+// a resumable upload.
+func (f *Fs) kamplexfsResumable(size int64) bool {
+	if f.kpx == nil || !f.kpx.resumable.Load() {
+		return false
+	}
+	return size < 0 || f.kpx.opt.Resumable == kamplexfsResumableAlways || f.opt.UploadConcurrency == 1
+}
+
+// kamplexfsResumableUnsupported returns why req can't be made as a
+// resumable upload, or "" if it can.
+//
+// Opening the session only stores the content type, the modification
+// time and the tags.
+func kamplexfsResumableUnsupported(req *s3.PutObjectInput) string {
+	for key := range req.Metadata {
+		if key != metaMtime {
+			return fmt.Sprintf("it has %q metadata", key)
+		}
+	}
+	switch {
+	case req.CacheControl != nil || req.ContentDisposition != nil || req.ContentEncoding != nil || req.ContentLanguage != nil:
+		return "it has content headers"
+	case req.IfMatch != nil || req.IfNoneMatch != nil:
+		return "it is conditional"
+	case req.ACL != "" || req.StorageClass != "":
+		return "it has an ACL or storage class"
+	case req.ServerSideEncryption != "" || req.SSECustomerAlgorithm != nil || req.SSEKMSKeyId != nil:
+		return "it is encrypted"
+	case req.ObjectLockMode != "" || req.ObjectLockRetainUntilDate != nil || req.ObjectLockLegalHoldStatus != "":
+		return "it has an object lock"
+	}
+	return ""
+}
+
+// kamplexfsRedact returns the session URL without its query, which
+// holds the token authorising the session.
+func kamplexfsRedact(location string) string {
+	before, _, _ := strings.Cut(location, "?")
+	return before
+}
+
+// kamplexfsUploadResumable uploads in with a resumable upload
+//
+// size is the size of the upload or -1 if it isn't known. It returns
+// the size uploaded and the ETag the server returned.
+//
+// It returns errKamplexfsNoResumable before reading from in if the
+// upload can't be made this way.
+func (o *Object) kamplexfsUploadResumable(ctx context.Context, src fs.ObjectInfo, in io.Reader, size int64, options ...fs.OpenOption) (ui uploadInfo, n int64, etag string, err error) {
+	ui, err = o.prepareUpload(ctx, src, options, true)
+	if err != nil {
+		return ui, size, "", fmt.Errorf("failed to prepare upload: %w", err)
+	}
+	if reason := kamplexfsResumableUnsupported(ui.req); reason != "" {
+		fs.Debugf(o, "KamPlexFS: not using a resumable upload as %s", reason)
+		return ui, size, "", errKamplexfsNoResumable
+	}
+	location, err := o.kamplexfsOpenSession(ctx, ui.req, size)
+	if err != nil {
+		return ui, size, "", err
+	}
+	bufSize := int64(o.fs.opt.ChunkSize)
+	if size >= 0 {
+		bufSize = min(bufSize, size)
+	}
+	t := &kamplexfsTus{
+		o:        o,
+		location: location,
+		size:     size,
+		in:       in,
+		buf:      make([]byte, 0, bufSize),
+	}
+	if o.fs.kpx.has(kamplexfsFeatureMD5) && !o.fs.opt.DisableChecksum {
+		t.md5 = md5.New()
+	}
+	err = t.upload(ctx)
+	if err != nil {
+		if !errors.Is(err, errKamplexfsSessionGone) {
+			t.abort(ctx)
+		}
+		return ui, size, "", err
+	}
+	if t.md5 != nil && t.etag != "" {
+		sent := hex.EncodeToString(t.md5.Sum(nil))
+		got := strings.Trim(strings.ToLower(t.etag), `"`)
+		if sent != got {
+			return ui, size, "", fmt.Errorf("upload corrupted: MD5 differ: sent %s but server has %s", sent, got)
+		}
+		fs.Debugf(o, "MD5 of upload: %s OK", sent)
+	}
+	return ui, t.offset, t.etag, nil
+}
+
+// kamplexfsSession is the response to opening a resumable upload
+type kamplexfsSession struct {
+	UploadID string `json:"uploadId"`
+	Location string `json:"location"`
+}
+
+// kamplexfsOpenSession opens a resumable upload of size bytes, or of
+// unknown size if size < 0, returning the session URL.
+func (o *Object) kamplexfsOpenSession(ctx context.Context, req *s3.PutObjectInput, size int64) (string, error) {
+	query := "kamplexfsResumable"
+	if size >= 0 {
+		query += "&kamplexfsUploadLength=" + strconv.FormatInt(size, 10)
+	}
+	u, err := o.fs.kamplexfsURL(*req.Bucket, *req.Key, query)
+	if err != nil {
+		return "", err
+	}
+	headers := map[string]string{
+		"Content-Type":     deref(req.ContentType),
+		"X-Amz-Meta-Mtime": req.Metadata[metaMtime],
+	}
+	if req.Tagging != nil {
+		headers["X-Amz-Tagging"] = *req.Tagging
+	}
+	var body []byte
+	err = o.fs.pacer.Call(func() (bool, error) {
+		body, err = o.fs.kamplexfsCall(ctx, http.MethodPost, u, headers)
+		return o.fs.shouldRetry(ctx, err)
+	})
+	if getHTTPStatusCode(err) == http.StatusNotImplemented {
+		fs.Debugf(o, "KamPlexFS: server has resumable uploads turned off, using multipart uploads: %v", err)
+		o.fs.kpx.resumable.Store(false)
+		return "", errKamplexfsNoResumable
+	}
+	if err != nil {
+		return "", fmt.Errorf("failed to open resumable upload: %w", err)
+	}
+	var session kamplexfsSession
+	err = json.Unmarshal(body, &session)
+	if err != nil {
+		return "", fmt.Errorf("failed to decode resumable upload: %w", err)
+	}
+	loc, err := url.Parse(session.Location)
+	if err != nil || (loc.Scheme != "http" && loc.Scheme != "https") || loc.Host == "" {
+		return "", fmt.Errorf("resumable upload has a bad location %q", kamplexfsRedact(session.Location))
+	}
+	// A server behind a TLS proxy which doesn't say so returns http URLs
+	fs.Debugf(o, "KamPlexFS: resumable upload %s at %s", session.UploadID, kamplexfsRedact(session.Location))
+	return session.Location, nil
+}
+
+// kamplexfsTus sends the data of a resumable upload with TUS
+//
+// The data is sent a chunk at a time, one PATCH per chunk, and each
+// chunk is held until the server has all of it so whatever didn't
+// arrive can be sent again.
+type kamplexfsTus struct {
+	o        *Object
+	location string    // the session URL, which authorises the requests
+	size     int64     // size of the upload, -1 if not known
+	in       io.Reader // the data to upload
+	md5      gohash.Hash
+	offset   int64  // bytes the server has
+	buf      []byte // the chunk held, read from in so far
+	start    int64  // offset of buf
+	eof      bool   // in is exhausted
+	inErr    error  // error reading in
+	final    bool   // a PATCH which completes the upload was sent
+	etag     string // ETag of the uploaded object
+}
+
+// held returns the offset of the end of the data read from in
+func (t *kamplexfsTus) held() int64 {
+	return t.start + int64(len(t.buf))
+}
+
+// chunkEnd returns the offset of the end of the chunk held
+func (t *kamplexfsTus) chunkEnd() int64 {
+	end := t.start + int64(cap(t.buf))
+	if t.size >= 0 {
+		end = min(end, t.size)
+	}
+	return end
+}
+
+// length returns the size of the upload, or -1 if it isn't known yet
+func (t *kamplexfsTus) length() int64 {
+	if t.size < 0 && t.eof {
+		return t.held()
+	}
+	return t.size
+}
+
+// setOffset sets the offset from what the server said it has
+func (t *kamplexfsTus) setOffset(header http.Header) error {
+	offset, err := strconv.ParseInt(header.Get("Upload-Offset"), 10, 64)
+	if err != nil {
+		return fmt.Errorf("resumable upload: bad Upload-Offset: %w", err)
+	}
+	// Only the chunk held can be sent again
+	if offset < t.start || offset > t.held() {
+		return fserrors.NoRetryError(fmt.Errorf("resumable upload: server has %d bytes but %d to %d are held", offset, t.start, t.held()))
+	}
+	t.offset = offset
+	return nil
+}
+
+// read reads more of the chunk from the source until some arrives,
+// the chunk is full or the source ends or fails.
+func (t *kamplexfsTus) read() {
+	limit := t.chunkEnd() - t.start
+	for !t.eof && t.inErr == nil && int64(len(t.buf)) < limit {
+		n, err := t.in.Read(t.buf[len(t.buf):limit])
+		if t.md5 != nil {
+			_, _ = t.md5.Write(t.buf[len(t.buf) : len(t.buf)+n])
+		}
+		t.buf = t.buf[:len(t.buf)+n]
+		if err == io.EOF {
+			t.eof = true
+		} else if err != nil {
+			t.inErr = err
+		}
+		if n > 0 {
+			return
+		}
+	}
+}
+
+// upload sends the data
+//
+// Failed requests are retried --low-level-retries times from what the
+// server has, counting again each time the server has more.
+func (t *kamplexfsTus) upload(ctx context.Context) error {
+	retries := fs.GetConfig(ctx).LowLevelRetries
+	tries, most := 0, t.offset
+	resync := false // HEAD to find the offset before the next PATCH
+	for {
+		offset, eof := t.offset, t.eof
+		var done, retry bool
+		err := t.o.fs.pacer.CallNoRetry(func() (bool, error) {
+			var err error
+			if resync {
+				err = t.head(ctx)
+			} else {
+				done, err = t.patch(ctx)
+			}
+			retry, err = t.shouldRetry(ctx, err)
+			return retry, err
+		})
+		if t.offset > most {
+			tries, most = 0, t.offset
+		}
+		if retry {
+			tries++
+			if tries < retries {
+				fs.Debugf(t.o, "KamPlexFS: resumable upload: retrying at offset %d (%d/%d): %v", t.offset, tries, retries, err)
+				resync = true
+				continue
+			}
+		}
+		if t.inErr != nil {
+			return fmt.Errorf("failed to read data to upload: %w", t.inErr)
+		}
+		if errors.Is(err, errKamplexfsSessionGone) && t.final {
+			// The upload may have completed with its answer lost
+			if t.completed(ctx) {
+				return nil
+			}
+			return fserrors.RetryError(err)
+		}
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+		if !resync && t.offset == offset && t.eof == eof {
+			return fmt.Errorf("resumable upload: server is stuck at offset %d", t.offset)
+		}
+		resync = false
+	}
+}
+
+// shouldRetry returns true if the request should be tried again
+// after reading the offset with a HEAD.
+func (t *kamplexfsTus) shouldRetry(ctx context.Context, err error) (bool, error) {
+	if err == nil || t.inErr != nil || errors.Is(err, errKamplexfsSessionGone) {
+		return false, err
+	}
+	if t.size >= 0 && t.eof && t.held() < t.size {
+		return false, fmt.Errorf("resumable upload: source is %d bytes, expecting %d: %w", t.held(), t.size, err)
+	}
+	switch status := getHTTPStatusCode(err); {
+	case status == http.StatusConflict:
+		// An empty conflict means the offset was wrong, maybe as
+		// the server hadn't finished with a PATCH which broke off.
+		var apiErr *kamplexfsError
+		return errors.As(err, &apiErr) && apiErr.Message == "", err
+	case status >= 500:
+		return true, err
+	}
+	return t.o.fs.shouldRetry(ctx, err)
+}
+
+// do makes a TUS request to the session
+//
+// It returns a *kamplexfsError for an error status, or
+// errKamplexfsSessionGone for a 404.
+func (t *kamplexfsTus) do(req *http.Request) (*http.Response, error) {
+	req.Header.Set("Tus-Resumable", kamplexfsTusVersion)
+	resp, err := t.o.fs.srv.Do(req)
+	if err != nil {
+		var urlErr *url.Error
+		if errors.As(err, &urlErr) {
+			urlErr.URL = kamplexfsRedact(urlErr.URL)
+		}
+		return nil, err
+	}
+	if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+		return resp, nil
+	}
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	_ = resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, errKamplexfsSessionGone
+	}
+	return nil, &kamplexfsError{
+		StatusCode: resp.StatusCode,
+		Code:       http.StatusText(resp.StatusCode),
+		Message:    strings.TrimSpace(string(body)),
+	}
+}
+
+// head reads the offset of the server
+func (t *kamplexfsTus) head(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, t.location, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := t.do(req)
+	if err != nil {
+		return err
+	}
+	_ = resp.Body.Close()
+	return t.setOffset(resp.Header)
+}
+
+// patch sends the chunk from the offset of the server, returning
+// true if that completes the upload.
+func (t *kamplexfsTus) patch(ctx context.Context) (done bool, err error) {
+	if t.offset == t.chunkEnd() && t.offset == t.held() && t.size != t.offset {
+		// The server has the whole chunk so start the next
+		t.start, t.buf = t.offset, t.buf[:0]
+	}
+	if t.size < 0 && t.offset == t.held() {
+		// Find out if the data has ended before starting, so the
+		// PATCH can say it completes the upload.
+		t.read()
+		if t.inErr != nil {
+			return false, t.inErr
+		}
+	}
+	body := &kamplexfsTusBody{t: t, pos: t.offset}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, t.location, body)
+	if err != nil {
+		return false, err
+	}
+	req.Header.Set("Content-Type", "application/offset+octet-stream")
+	req.Header.Set("Upload-Offset", strconv.FormatInt(t.offset, 10))
+	length := t.length()
+	if t.size < 0 && length >= 0 {
+		// Once set it may be repeated, so send it whenever it is known
+		req.Header.Set("Upload-Length", strconv.FormatInt(length, 10))
+	}
+	end := t.chunkEnd()
+	switch {
+	case t.size >= 0:
+		req.ContentLength = end - t.offset
+	case t.eof:
+		end = t.held()
+		req.ContentLength = end - t.offset
+	default:
+		req.ContentLength = -1
+	}
+	if req.ContentLength == 0 {
+		req.Body = http.NoBody
+	}
+	t.final = t.final || (length >= 0 && end == length)
+	resp, err := t.do(req)
+	// Make sure the transport has stopped reading the chunk
+	_ = body.Close()
+	if err != nil {
+		return false, err
+	}
+	_ = resp.Body.Close()
+	err = t.setOffset(resp.Header)
+	if err != nil {
+		return false, err
+	}
+	total, err := strconv.ParseInt(resp.Header.Get("Upload-Length"), 10, 64)
+	if err != nil || t.offset != total {
+		return false, nil
+	}
+	t.etag = resp.Header.Get("ETag")
+	t.o.kamplexfsSetBlake3FromHeader(resp.Header)
+	return true, nil
+}
+
+// completed returns true if the object is stored as uploaded, for
+// when the session went away before the answer to its last PATCH
+// arrived.
+func (t *kamplexfsTus) completed(ctx context.Context) bool {
+	head, err := t.o.headObject(ctx)
+	if err != nil {
+		fs.Debugf(t.o, "KamPlexFS: resumable upload session gone and object not found: %v", err)
+		return false
+	}
+	etag := strings.Trim(strings.ToLower(deref(head.ETag)), `"`)
+	if deref(head.ContentLength) != t.length() || (t.md5 != nil && etag != hex.EncodeToString(t.md5.Sum(nil))) {
+		fs.Debugf(t.o, "KamPlexFS: resumable upload session gone and object is size %d ETag %q", deref(head.ContentLength), etag)
+		return false
+	}
+	fs.Debugf(t.o, "KamPlexFS: resumable upload session gone but the object is stored")
+	t.offset, t.etag = t.length(), deref(head.ETag)
+	t.o.kamplexfsSetBlake3(head.ResultMetadata)
+	return true
+}
+
+// abort deletes the session, freeing what the server has of it
+func (t *kamplexfsTus) abort(ctx context.Context) {
+	// Delete it even if ctx was cancelled, but don't hold up exiting
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, t.location, nil)
+	if err == nil {
+		var resp *http.Response
+		resp, err = t.do(req)
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+	}
+	if err != nil {
+		fs.Debugf(t.o, "KamPlexFS: failed to delete resumable upload: %v", err)
+	}
+}
+
+// kamplexfsTusBody is the body of a PATCH
+//
+// It sends the chunk held from its offset and then reads the rest of
+// the chunk from the source into it.
+type kamplexfsTusBody struct {
+	mu     sync.Mutex
+	t      *kamplexfsTus
+	pos    int64 // offset of the next byte to send
+	closed bool
+}
+
+// Read reads the next part of the chunk
+func (b *kamplexfsTusBody) Read(p []byte) (n int, err error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	t := b.t
+	if b.closed {
+		return 0, errors.New("resumable upload: read after close")
+	}
+	if b.pos == t.held() {
+		t.read()
+		if b.pos == t.held() {
+			if t.inErr != nil {
+				return 0, t.inErr
+			}
+			return 0, io.EOF
+		}
+	}
+	n = copy(p, t.buf[b.pos-t.start:])
+	b.pos += int64(n)
+	return n, nil
+}
+
+// Close stops the body being read
+func (b *kamplexfsTusBody) Close() error {
+	b.mu.Lock()
+	b.closed = true
+	b.mu.Unlock()
+	return nil
 }
